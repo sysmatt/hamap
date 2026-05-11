@@ -5,10 +5,12 @@ import argparse
 import configparser
 import logging
 import logging.handlers
+import math
 import os
 import re
 import sys
-from collections import defaultdict
+import warnings
+from collections import Counter, defaultdict
 
 # Set matplotlib backend before pyplot import; check argv directly so this
 # works regardless of import order.
@@ -439,6 +441,49 @@ COUNTRY_CENTROIDS = {
 
 
 # --------------------------------------------------------------------------- #
+# US state and Canadian province centroids  (for --label-states)
+# --------------------------------------------------------------------------- #
+
+STATE_CENTROIDS = {
+    # US States
+    'Alabama':       ( 32.8,  -86.8), 'Alaska':         ( 64.0, -153.0),
+    'Arizona':       ( 34.3, -111.1), 'Arkansas':        ( 34.7,  -92.4),
+    'California':    ( 36.8, -119.4), 'Colorado':        ( 39.0, -105.5),
+    'Connecticut':   ( 41.6,  -72.7), 'Delaware':        ( 39.1,  -75.4),
+    'Florida':       ( 27.8,  -81.5), 'Georgia':         ( 32.7,  -83.4),
+    'Hawaii':        ( 20.5, -157.0), 'Idaho':           ( 44.3, -114.5),
+    'Illinois':      ( 40.6,  -89.2), 'Indiana':         ( 40.3,  -86.1),
+    'Iowa':          ( 42.0,  -93.1), 'Kansas':          ( 38.5,  -98.4),
+    'Kentucky':      ( 37.6,  -84.7), 'Louisiana':       ( 31.0,  -91.8),
+    'Maine':         ( 45.3,  -69.0), 'Maryland':        ( 39.0,  -76.8),
+    'Massachusetts': ( 42.3,  -71.8), 'Michigan':        ( 44.3,  -85.4),
+    'Minnesota':     ( 46.3,  -94.3), 'Mississippi':     ( 32.7,  -89.6),
+    'Missouri':      ( 38.4,  -92.5), 'Montana':         ( 47.0, -110.0),
+    'Nebraska':      ( 41.5,  -99.5), 'Nevada':          ( 39.0, -117.0),
+    'New Hampshire': ( 44.0,  -71.6), 'New Jersey':      ( 40.1,  -74.5),
+    'New Mexico':    ( 34.5, -106.1), 'New York':        ( 42.7,  -75.4),
+    'North Carolina':( 35.6,  -79.4), 'North Dakota':    ( 47.5, -100.3),
+    'Ohio':          ( 40.4,  -82.7), 'Oklahoma':        ( 35.6,  -97.5),
+    'Oregon':        ( 44.1, -120.5), 'Pennsylvania':    ( 40.9,  -77.8),
+    'Rhode Island':  ( 41.7,  -71.5), 'South Carolina':  ( 33.9,  -80.9),
+    'South Dakota':  ( 44.4, -100.2), 'Tennessee':       ( 35.9,  -86.5),
+    'Texas':         ( 31.5,  -99.3), 'Utah':            ( 39.4, -111.1),
+    'Vermont':       ( 44.1,  -72.7), 'Virginia':        ( 37.5,  -79.0),
+    'Washington':    ( 47.4, -120.5), 'West Virginia':   ( 38.6,  -80.6),
+    'Wisconsin':     ( 44.8,  -89.6), 'Wyoming':         ( 43.0, -107.6),
+    # Canadian Provinces and Territories
+    'Alberta':       ( 54.0, -114.4), 'British Columbia':( 54.0, -124.0),
+    'Manitoba':      ( 55.0,  -97.0), 'New Brunswick':   ( 46.5,  -66.5),
+    'Newfoundland and Labrador': (53.0, -60.0),
+    'Northwest Territories': (64.3, -119.2),
+    'Nova Scotia':   ( 44.8,  -63.2), 'Nunavut':         ( 70.0,  -86.0),
+    'Ontario':       ( 51.0,  -85.0), 'Prince Edward Island': (46.4, -63.4),
+    'Quebec':        ( 53.0,  -72.0), 'Saskatchewan':    ( 54.0, -106.4),
+    'Yukon':         ( 63.0, -135.0),
+}
+
+
+# --------------------------------------------------------------------------- #
 # ADIF parsing
 # --------------------------------------------------------------------------- #
 
@@ -584,7 +629,8 @@ def do_setup(log):
         ('physical',  'ocean',             '10m'),
         ('physical',  'coastline',         '10m'),
         ('physical',  'lakes',             '10m'),
-        ('cultural',  'admin_0_countries', '10m'),
+        ('cultural',  'admin_0_countries',         '10m'),
+        ('cultural',  'admin_1_states_provinces',  '10m'),
         ('physical',  'land',              '110m'),
         ('physical',  'ocean',             '110m'),
         ('physical',  'coastline',         '110m'),
@@ -595,7 +641,9 @@ def do_setup(log):
     for category, name, resolution in tasks:
         log.info("  %s/%s @ %s ...", category, name, resolution)
         try:
-            shpreader.natural_earth(resolution=resolution, category=category, name=name)
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore')
+                shpreader.natural_earth(resolution=resolution, category=category, name=name)
             log.info("    cached")
             ok += 1
         except Exception as exc:
@@ -614,106 +662,408 @@ _LAND_COLOR = '#1e3a1e'    # dark green land
 _COAST_CLR  = '#3a7a3a'    # coastline / border colour
 _GRID_CLR   = '#1e3050'    # graticule colour
 
+# Axes rect within the figure (left, bottom, width, height as fractions)
+_AX_RECT    = [0.0, 0.04, 1.0, 0.92]
+
+
+# --------------------------------------------------------------------------- #
+# Grouping contacts by grid square / location
+# --------------------------------------------------------------------------- #
+
+def group_by_grid(qsos_with_pos, truncate=False):
+    """
+    Group QSOs by GRIDSQUARE (normalised to uppercase, optionally truncated to 4 chars).
+    Contacts without a grid fall back to country name, then rounded lat/lon.
+
+    Returns a dict:
+        key → {
+            'dot_lat': float, 'dot_lon': float,
+            'qsos':    [qso, ...],
+            'label_header': str,   # first line of the annotation box
+            'color':   str,        # hex colour for dot + line + box
+        }
+    """
+    groups = {}
+
+    for qso, (lat, lon) in qsos_with_pos:
+        grid = qso.get('GRIDSQUARE', '').upper().strip()
+        if grid:
+            if truncate:
+                grid = grid[:4]
+            key = grid
+            label_header = grid
+        else:
+            country = qso.get('COUNTRY', '').strip()
+            if country:
+                key = f'_CTY_{country}'
+                label_header = country[:14]
+            else:
+                key = f'_POS_{lat:.0f}_{lon:.0f}'
+                label_header = (f"{abs(lat):.0f}°{'N' if lat >= 0 else 'S'} "
+                                f"{abs(lon):.0f}°{'E' if lon >= 0 else 'W'}")
+
+        if key not in groups:
+            groups[key] = {
+                'dot_lat':      lat,
+                'dot_lon':      lon,
+                'qsos':         [],
+                'label_header': label_header,
+            }
+        groups[key]['qsos'].append(qso)
+
+    # Assign one colour per group based on the most common band
+    for info in groups.values():
+        band_counts = Counter(qso.get('BAND', 'unknown').lower()
+                              for qso in info['qsos'])
+        top_band = band_counts.most_common(1)[0][0]
+        info['color'] = BAND_COLORS.get(top_band, UNKNOWN_COLOR)
+
+    return groups
+
+
+# --------------------------------------------------------------------------- #
+# Label placement  (pixel-coordinate greedy placer)
+# --------------------------------------------------------------------------- #
+
+def _ax_pixel_fns(ax, args):
+    """Closures for pixel ↔ lat/lon conversion at render resolution."""
+    dpi      = args.dpi
+    fig_w_px = args.width  * dpi
+    fig_h_px = args.height * dpi
+    pos      = ax.get_position()
+    ax_x0    = pos.x0 * fig_w_px
+    ax_y0    = pos.y0 * fig_h_px
+    ax_w_px  = (pos.x1 - pos.x0) * fig_w_px
+    ax_h_px  = (pos.y1 - pos.y0) * fig_h_px
+
+    def ll_to_px(lon, lat):
+        return (ax_x0 + (lon + 180.0) / 360.0 * ax_w_px,
+                ax_y0 + (lat +  90.0) / 180.0 * ax_h_px)
+
+    def px_to_ll(cx, cy):
+        return (-90.0  + (cy - ax_y0) / ax_h_px * 180.0,
+                -180.0 + (cx - ax_x0) / ax_w_px * 360.0)
+
+    return ll_to_px, px_to_ll, ax_x0, ax_y0, ax_w_px, ax_h_px
+
+
+# Candidate placement angles: straight up first, then sweeping outward.
+# Using cos/sin convention: 0° = right, 90° = up in screen space.
+_PLACE_ANGLES = [90, 60, 120, 30, 150, 0, 180, -30, -150,
+                 -60, -120, -90, 75, 105, 45, 135, 15, 165,
+                 -15, -165, -45, -135, -75, -105]
+
+
+def place_labels(groups, args, log, ax, pre_placed=None):
+    """
+    Two-pass greedy label placer working entirely in display (pixel) coordinates.
+
+    pre_placed: optional list of [cx, cy, hw, hh, key] obstacles already on the
+                map (e.g. country/state text labels) that callsign boxes must avoid.
+
+    Returns (positions, boxes_px) where:
+        positions = {key: (label_lat, label_lon)}   — box centres in data coords
+        boxes_px  = {key: (cx, cy, hw, hh)}         — box geometry in pixels
+    """
+    font_pt = args.font_size
+    dpi     = args.dpi
+
+    ll_to_px, px_to_ll, ax_x0, ax_y0, ax_w_px, ax_h_px = _ax_pixel_fns(ax, args)
+
+    # ── Per-group helpers ────────────────────────────────────────────────────
+    def _calls(info):
+        return sorted({qso.get('CALL', '') for qso in info['qsos']})
+
+    def _box_px(info):
+        """Return (w_px, h_px) matching the new split rendering layout."""
+        char_h  = font_pt * dpi / 72.0
+        char_w  = char_h * 0.62
+        leading = char_h * 1.2
+        pad     = char_h * 0.2
+        calls   = _calls(info)
+        max_ch  = max(len(l) for l in [info['label_header']] + (calls or ['']))
+        # top pad + header + small sep zone + N call lines + bottom pad
+        h_px    = pad + char_h + pad * 0.5 + 1.0 + len(calls) * leading + pad
+        return max_ch * char_w + 2 * pad, h_px
+
+    dot_r_px = math.sqrt(10.0 / math.pi) * (dpi / 72.0) + 2.0
+    gap_px   = max(4.0, font_pt * dpi / 72.0 * 0.6)
+
+    dot_obs = {k: ll_to_px(info['dot_lon'], info['dot_lat'])
+               for k, info in groups.items()}
+
+    # Pre-load fixed obstacles (country/state labels, etc.)
+    placed    = list(pre_placed) if pre_placed else []
+    positions = {}
+
+    def _in_bounds(cx, cy, hw, hh, margin=4.0):
+        return (cx - hw >= ax_x0 + margin and
+                cx + hw <= ax_x0 + ax_w_px - margin and
+                cy - hh >= ax_y0 + margin and
+                cy + hh <= ax_y0 + ax_h_px - margin)
+
+    def _collides(cx, cy, hw, hh, skip_key=None):
+        for entry in placed:
+            if entry[4] == skip_key:
+                continue
+            if (abs(cx - entry[0]) < hw + entry[2] + gap_px and
+                    abs(cy - entry[1]) < hh + entry[3] + gap_px):
+                return True
+        for k, (dx, dy) in dot_obs.items():
+            if k == skip_key:
+                continue
+            if (abs(cx - dx) < hw + dot_r_px + gap_px and
+                    abs(cy - dy) < hh + dot_r_px + gap_px):
+                return True
+        return False
+
+    def _try_place(info, skip_key=None):
+        dx, dy     = ll_to_px(info['dot_lon'], info['dot_lat'])
+        w_px, h_px = _box_px(info)
+        hw, hh     = w_px / 2.0, h_px / 2.0
+        r0         = dot_r_px + math.hypot(hw, hh) + gap_px
+
+        for mult in [1.0, 1.35, 1.75, 2.3, 3.1, 4.2, 5.8, 8.0, 11.0, 16.0, 24.0]:
+            r = r0 * mult
+            for ang_deg in _PLACE_ANGLES:
+                ang = math.radians(ang_deg)
+                cx  = dx + r * math.cos(ang)
+                cy  = dy + r * math.sin(ang)
+                if not _in_bounds(cx, cy, hw, hh):
+                    continue
+                if not _collides(cx, cy, hw, hh, skip_key=skip_key):
+                    return cx, cy, hw, hh
+        return None
+
+    order = sorted(groups.keys(), key=lambda k: -len(groups[k]['qsos']))
+
+    log.verbose("Label placement pass 1 (%d groups)...", len(order))
+    for key in order:
+        info   = groups[key]
+        result = _try_place(info, skip_key=key)
+        if result:
+            cx, cy, hw, hh = result
+        else:
+            dx, dy     = ll_to_px(info['dot_lon'], info['dot_lat'])
+            w_px, h_px = _box_px(info)
+            hw, hh     = w_px / 2.0, h_px / 2.0
+            cx, cy     = dx, dy + dot_r_px + hh + gap_px
+            log.debug("Label placement fallback for %s", key)
+        placed.append([cx, cy, hw, hh, key])
+        positions[key] = px_to_ll(cx, cy)
+
+    log.verbose("Label placement pass 2: relaxing distant labels...")
+    improved = 0
+    for i, entry in enumerate(placed):
+        cx, cy, hw, hh, key = entry
+        if key not in groups:
+            continue    # skip pre-placed obstacles
+        info     = groups[key]
+        dx, dy   = ll_to_px(info['dot_lon'], info['dot_lat'])
+        cur_dist = math.hypot(cx - dx, cy - dy)
+        w_px, h_px = _box_px(info)
+        r0       = dot_r_px + math.hypot(w_px / 2, h_px / 2) + gap_px
+
+        if cur_dist <= r0 * 2.2:
+            continue
+
+        result = _try_place(info, skip_key=key)
+        if result:
+            ncx, ncy, nhw, nhh = result
+            if math.hypot(ncx - dx, ncy - dy) < cur_dist * 0.80:
+                placed[i]      = [ncx, ncy, nhw, nhh, key]
+                positions[key] = px_to_ll(ncx, ncy)
+                improved      += 1
+
+    if improved:
+        log.verbose("  Moved %d label(s) closer to their dots.", improved)
+
+    boxes_px = {key: (cx, cy, hw, hh)
+                for cx, cy, hw, hh, key in placed if key in groups}
+    return positions, boxes_px
+
+
+# --------------------------------------------------------------------------- #
+# Map figure assembly
+# --------------------------------------------------------------------------- #
 
 def generate_map(qsos_with_pos, home_pos, args, log):
     """Build and return a matplotlib Figure containing the contact map."""
-    proj = ccrs.PlateCarree()
+    proj     = ccrs.PlateCarree()
     geodetic = ccrs.Geodetic()
 
     fig = plt.figure(figsize=(args.width, args.height), facecolor=_MAP_BG)
-    ax = fig.add_axes([0.0, 0.04, 1.0, 0.92], projection=proj, facecolor=_MAP_BG)
+    ax  = fig.add_axes(_AX_RECT, projection=proj, facecolor=_MAP_BG)
     ax.set_global()
 
-    # ---- Natural Earth background features --------------------------------
+    # ---- Natural Earth background ----------------------------------------
     log.verbose("Loading map features...")
-    _land = cfeature.NaturalEarthFeature(
-        'physical', 'land', '10m', facecolor=_LAND_COLOR, edgecolor='none')
-    _ocean = cfeature.NaturalEarthFeature(
-        'physical', 'ocean', '10m', facecolor=_MAP_BG, edgecolor='none')
-    _coast = cfeature.NaturalEarthFeature(
-        'physical', 'coastline', '10m',
-        facecolor='none', edgecolor=_COAST_CLR, linewidth=0.35)
-    _borders = cfeature.NaturalEarthFeature(
-        'cultural', 'admin_0_countries', '10m',
-        facecolor='none', edgecolor='#2a5a2a', linewidth=0.20)
-    _lakes = cfeature.NaturalEarthFeature(
-        'physical', 'lakes', '10m',
-        facecolor=_MAP_BG, edgecolor=_COAST_CLR, linewidth=0.20)
+    ax.add_feature(cfeature.NaturalEarthFeature(
+        'physical', 'ocean', '10m', facecolor=_MAP_BG, edgecolor='none'))
+    ax.add_feature(cfeature.NaturalEarthFeature(
+        'physical', 'land', '10m', facecolor=_LAND_COLOR, edgecolor='none'))
+    ax.add_feature(cfeature.NaturalEarthFeature(
+        'physical', 'lakes', '10m', facecolor=_MAP_BG,
+        edgecolor=_COAST_CLR, linewidth=0.20))
+    ax.add_feature(cfeature.NaturalEarthFeature(
+        'physical', 'coastline', '10m', facecolor='none',
+        edgecolor=_COAST_CLR, linewidth=0.35))
+    ax.add_feature(cfeature.NaturalEarthFeature(
+        'cultural', 'admin_0_countries', '10m', facecolor='none',
+        edgecolor='#2a5a2a', linewidth=0.20))
 
-    ax.add_feature(_ocean)
-    ax.add_feature(_land)
-    ax.add_feature(_lakes)
-    ax.add_feature(_coast)
-    ax.add_feature(_borders)
+    if args.label_states:
+        ax.add_feature(cfeature.NaturalEarthFeature(
+            'cultural', 'admin_1_states_provinces', '10m', facecolor='none',
+            edgecolor='#4a7a4a', linewidth=0.3))
 
-    # ---- Graticule --------------------------------------------------------
+    # ---- Graticule -------------------------------------------------------
     gl = ax.gridlines(linewidth=0.15, color=_GRID_CLR, alpha=0.8,
                       linestyle='-', draw_labels=False)
     gl.xlocator = mticker.MultipleLocator(30)
     gl.ylocator = mticker.MultipleLocator(30)
 
-    # ---- Group by band ----------------------------------------------------
-    by_band = defaultdict(list)
-    for qso, (lat, lon) in qsos_with_pos:
-        band = qso.get('BAND', 'unknown').lower()
-        by_band[band].append((qso, lat, lon))
+    # ---- Group contacts by grid square -----------------------------------
+    log.verbose("Grouping contacts...")
+    groups = group_by_grid(qsos_with_pos, truncate=args.truncate_grids)
+    log.verbose("  %d unique grid/location groups from %d QSOs",
+                len(groups), len(qsos_with_pos))
 
-    sorted_bands = sorted(by_band.keys(), key=_band_sort_key)
+    # ---- Fixed text labels (countries / states) — drawn first, act as obstacles
+    ll_to_px, px_to_ll, *_ = _ax_pixel_fns(ax, args)
+    pre_placed = []
 
-    # ---- Great-circle lines -----------------------------------------------
-    if home_pos and not args.no_lines:
-        log.verbose("Drawing %d great-circle lines...", len(qsos_with_pos))
-        home_lat, home_lon = home_pos
-        for band in sorted_bands:
-            color = BAND_COLORS.get(band, UNKNOWN_COLOR)
-            for _qso, lat, lon in by_band[band]:
-                ax.plot(
-                    [home_lon, lon], [home_lat, lat],
-                    transform=geodetic,
-                    color=color, alpha=0.12, linewidth=0.4,
-                    solid_capstyle='round', zorder=3,
-                )
+    def _text_obs(name, lat, lon, fpt):
+        """Pixel-space obstacle rect for a single-line text label."""
+        ch  = fpt * args.dpi / 72.0
+        cw  = ch * 0.62
+        pad = ch * 0.5
+        cx, cy = ll_to_px(lon, lat)
+        hw = len(name) * cw / 2 + pad
+        hh = ch * 1.35 / 2 + pad * 0.5
+        return [cx, cy, hw, hh, f'_LBL_{name}']
 
-    # ---- Contact dot markers ----------------------------------------------
-    log.verbose("Plotting contact markers...")
-    for band in sorted_bands:
-        color = BAND_COLORS.get(band, UNKNOWN_COLOR)
-        lats = [e[1] for e in by_band[band]]
-        lons = [e[2] for e in by_band[band]]
-        ax.scatter(lons, lats, transform=proj,
-                   s=8, color=color, alpha=0.85,
-                   linewidths=0, zorder=5)
+    if args.label_countries:
+        log.verbose("Drawing country labels...")
+        cfont = max(2.0, args.font_size * 0.85)
+        for country, (clat, clon) in COUNTRY_CENTROIDS.items():
+            pre_placed.append(_text_obs(country, clat, clon, cfont))
+            ax.text(clon, clat, country, transform=proj,
+                    fontsize=cfont, color='#7a9aaa',
+                    va='center', ha='center',
+                    fontfamily='monospace', alpha=0.65, zorder=5)
 
-    # ---- Callsign labels --------------------------------------------------
+    if args.label_states:
+        log.verbose("Drawing state/province labels...")
+        sfont = max(1.8, args.font_size * 0.75)
+        for state, (slat, slon) in STATE_CENTROIDS.items():
+            pre_placed.append(_text_obs(state, slat, slon, sfont))
+            ax.text(slon, slat, state, transform=proj,
+                    fontsize=sfont, color='#8899aa',
+                    va='center', ha='center',
+                    fontfamily='monospace', alpha=0.55, zorder=5)
+
+    # ---- Compute label positions -----------------------------------------
     if not args.no_labels:
-        unique_calls = len({e[0].get('CALL', '') for entries in by_band.values() for e in entries})
-        if unique_calls > 5000:
-            log.warning("Skipping labels: %d unique callsigns exceeds 5000 limit "
-                        "(use --no-labels to suppress this warning)", unique_calls)
-        else:
-            log.verbose("Adding labels for %d unique callsigns...", unique_calls)
-            seen = set()
-            for band in sorted_bands:
-                color = BAND_COLORS.get(band, UNKNOWN_COLOR)
-                for qso, lat, lon in by_band[band]:
-                    call = qso.get('CALL', '')
-                    if call in seen:
-                        continue
-                    seen.add(call)
-                    label = call
-                    grid = qso.get('GRIDSQUARE', '')
-                    if grid:
-                        label = f"{call} {grid[:4]}"
-                    ax.text(
-                        lon, lat, label,
+        log.verbose("Computing label positions...")
+        label_pos, boxes_px = place_labels(groups, args, log, ax,
+                                           pre_placed=pre_placed)
+    else:
+        label_pos, boxes_px = {}, {}
+
+    # ---- Great-circle lines (one arc per unique dot) ---------------------
+    if home_pos and not args.no_lines:
+        home_lat, home_lon = home_pos
+        log.verbose("Drawing %d great-circle lines...", len(groups))
+        for info in groups.values():
+            ax.plot(
+                [home_lon, info['dot_lon']], [home_lat, info['dot_lat']],
+                transform=geodetic,
+                color=info['color'], alpha=0.13, linewidth=0.4,
+                solid_capstyle='round', zorder=3,
+            )
+
+    # ---- Leader lines (dot → label box) ----------------------------------
+    if not args.no_labels:
+        for key, info in groups.items():
+            if key not in label_pos:
+                continue
+            lbl_lat, lbl_lon = label_pos[key]
+            ax.plot(
+                [info['dot_lon'], lbl_lon],
+                [info['dot_lat'], lbl_lat],
+                transform=proj,
+                color=info['color'], alpha=0.70, linewidth=0.5,
+                solid_capstyle='round', zorder=6,
+            )
+
+    # ---- Contact dot markers ---------------------------------------------
+    log.verbose("Plotting %d contact dots...", len(groups))
+    for info in groups.values():
+        ax.scatter(
+            info['dot_lon'], info['dot_lat'],
+            transform=proj,
+            s=10, color=info['color'], alpha=0.9,
+            linewidths=0.6, edgecolors=info['color'],
+            zorder=7,
+        )
+
+    # ---- Label boxes (drawn on top of leader line ends) ------------------
+    if not args.no_labels:
+        log.verbose("Drawing %d label boxes...", len(label_pos))
+        char_h  = args.font_size * args.dpi / 72.0
+        leading = char_h * 1.2
+        pad_px  = char_h * 0.2
+
+        for key, info in groups.items():
+            if key not in label_pos or key not in boxes_px:
+                continue
+            lbl_lat, lbl_lon = label_pos[key]
+            cx, cy, hw, hh   = boxes_px[key]
+            color = info['color']
+            calls = sorted({qso.get('CALL', '') for qso in info['qsos']})
+
+            # Background + border rectangle
+            top_lat,  left_lon  = px_to_ll(cx - hw, cy + hh)
+            bot_lat,  right_lon = px_to_ll(cx + hw, cy - hh)
+            rect = mpatches.FancyBboxPatch(
+                (left_lon, bot_lat), right_lon - left_lon, top_lat - bot_lat,
+                boxstyle='round,pad=0',
+                transform=proj,
+                facecolor=_MAP_BG, alpha=0.90,
+                edgecolor=color, linewidth=0.6,
+                zorder=8,
+            )
+            ax.add_patch(rect)
+
+            # Header text
+            hdr_y_px   = cy + hh - pad_px - char_h * 0.5
+            hdr_lat, _ = px_to_ll(cx, hdr_y_px)
+            ax.text(lbl_lon, hdr_lat, info['label_header'],
+                    transform=proj,
+                    fontsize=args.font_size, color=color,
+                    va='center', ha='center',
+                    fontfamily='monospace', zorder=9)
+
+            # Separator line — tight below header baseline
+            sep_y_px   = cy + hh - pad_px - char_h - pad_px * 0.25
+            sep_lat, _ = px_to_ll(cx, sep_y_px)
+            _, sep_l   = px_to_ll(cx - hw, sep_y_px)
+            _, sep_r   = px_to_ll(cx + hw, sep_y_px)
+            ax.plot([sep_l, sep_r], [sep_lat, sep_lat],
+                    transform=proj, color=color,
+                    linewidth=0.5, alpha=0.85,
+                    solid_capstyle='butt', zorder=9)
+
+            # Callsign text block
+            if calls:
+                calls_center_y   = sep_y_px - pad_px * 0.25 - len(calls) * leading / 2
+                calls_lat, _     = px_to_ll(cx, calls_center_y)
+                ax.text(lbl_lon, calls_lat, '\n'.join(calls),
                         transform=proj,
-                        fontsize=3.5, color=color, alpha=0.95,
-                        va='bottom', ha='left',
-                        fontfamily='monospace',
-                        bbox=dict(facecolor=_MAP_BG, alpha=0.35,
-                                  pad=0.3, edgecolor='none'),
-                        zorder=7,
-                    )
+                        fontsize=args.font_size, color=color,
+                        va='center', ha='center',
+                        fontfamily='monospace', zorder=9)
 
     # ---- Home station marker ---------------------------------------------
     if home_pos:
@@ -721,35 +1071,144 @@ def generate_map(qsos_with_pos, home_pos, args, log):
         ax.plot(home_lon, home_lat, transform=proj,
                 marker='*', color='#FFFF00', markersize=14,
                 markeredgecolor='#FF8800', markeredgewidth=0.8,
-                zorder=10, label='Home')
+                zorder=10)
 
-    # ---- Band legend ------------------------------------------------------
+    # ---- Band legend -----------------------------------------------------
+    present_bands = sorted(
+        {qso.get('BAND', 'unknown').lower()
+         for info in groups.values() for qso in info['qsos']},
+        key=_band_sort_key,
+    )
     legend_patches = [
         mpatches.Patch(color=BAND_COLORS.get(b, UNKNOWN_COLOR), label=b)
-        for b in sorted_bands
+        for b in present_bands
     ]
     if legend_patches:
-        ncols = max(1, len(legend_patches) // 8)
         leg = ax.legend(
             handles=legend_patches,
-            loc='lower left', fontsize=7,
+            loc='lower right', fontsize=7,
             framealpha=0.65, facecolor=_MAP_BG,
             edgecolor='#334455', labelcolor='white',
-            ncol=ncols, borderpad=0.5,
+            ncol=max(1, len(legend_patches) // 8), borderpad=0.5,
         )
         leg.set_zorder(20)
 
-    # ---- Stats title ------------------------------------------------------
-    total = len(qsos_with_pos)
-    unique_cs = len({qso.get('CALL', '') for qso, _ in qsos_with_pos})
-    countries = len({qso.get('COUNTRY', '') for qso, _ in qsos_with_pos if qso.get('COUNTRY')})
-    title = f"{total:,} QSOs  ·  {unique_cs:,} unique callsigns  ·  {countries} countries"
-    fig.text(0.5, 0.975, title, ha='center', va='top',
-             color='white', fontsize=9, alpha=0.9)
+    # ---- Summary statistics box (lower-left, axes-relative) -------------
+    total       = len(qsos_with_pos)
+    unique_cs   = len({qso.get('CALL', '')     for qso, _ in qsos_with_pos})
+    unique_grid = len({qso.get('GRIDSQUARE', '').upper().strip()
+                       for qso, _ in qsos_with_pos
+                       if qso.get('GRIDSQUARE', '').strip()})
+    countries   = len({qso.get('COUNTRY', '')
+                       for qso, _ in qsos_with_pos if qso.get('COUNTRY')})
+
+    # Fixed-width label column so the numbers align
+    w = 12   # label column width
+    stat_lines = [
+        f"{'Contacts:':<{w}}{total:>7,}",
+        f"{'Grids:':<{w}}{unique_grid:>7,}",
+        f"{'Callsigns:':<{w}}{unique_cs:>7,}",
+        f"{'Countries:':<{w}}{countries:>7,}",
+    ]
+
+    filter_lines = []
+    if getattr(args, 'start', None):
+        filter_lines.append(f"{'Start:':<{w}}{_fmt_date(args.start):>7}")
+    if getattr(args, 'end', None):
+        filter_lines.append(f"{'End:':<{w}}{_fmt_date(args.end):>7}")
+    if getattr(args, 'tail_days', None) is not None:
+        filter_lines.append(f"{'Tail days:':<{w}}{args.tail_days:>7,}")
+    if getattr(args, 'tail', None) is not None:
+        filter_lines.append(f"{'Tail recs:':<{w}}{args.tail:>7,}")
+
+    if filter_lines:
+        rule = '─' * (w + 7)   # ─────────── separator
+        all_lines = stat_lines + [rule] + filter_lines
+    else:
+        all_lines = stat_lines
+
+    summary_text = '\n'.join(all_lines)
+
+    ax.text(
+        0.012, 0.025, summary_text,
+        transform=ax.transAxes,
+        fontsize=6.5, color='#c8d8e8',
+        va='bottom', ha='left',
+        fontfamily='monospace',
+        bbox=dict(
+            facecolor=_MAP_BG, alpha=0.90,
+            boxstyle='round,pad=0.55',
+            edgecolor='#3a5a7a', linewidth=0.7,
+        ),
+        zorder=15,
+    )
+
     fig.text(0.5, 0.005, 'generated by hamap', ha='center', va='bottom',
              color='#336633', fontsize=6, alpha=0.7)
 
     return fig
+
+
+# --------------------------------------------------------------------------- #
+# Date filtering
+# --------------------------------------------------------------------------- #
+
+def _parse_date_arg(s):
+    """Normalise a user-supplied date to YYYYMMDD for ADIF comparison."""
+    clean = s.strip().replace('-', '')
+    if not re.match(r'^\d{8}$', clean):
+        raise argparse.ArgumentTypeError(
+            f"Invalid date {s!r} — expected YYYY-MM-DD or YYYYMMDD"
+        )
+    return clean
+
+
+def _fmt_date(s):
+    """Format a YYYYMMDD string as YYYY-MM-DD for display."""
+    if s and len(s) == 8:
+        return f"{s[:4]}-{s[4:6]}-{s[6:]}"
+    return s
+
+
+def filter_records(records, args, log):
+    """Apply --start / --end / --tail-days / --tail filters. Returns filtered list."""
+    from datetime import date, timedelta
+
+    original = len(records)
+
+    def _date(rec):
+        return rec.get('QSO_DATE', '')
+
+    if args.start:
+        before  = len(records)
+        records = [r for r in records if not _date(r) or _date(r) >= args.start]
+        log.verbose("--start %s: %d → %d records", args.start, before, len(records))
+
+    if args.end:
+        before  = len(records)
+        records = [r for r in records if not _date(r) or _date(r) <= args.end]
+        log.verbose("--end %s: %d → %d records", args.end, before, len(records))
+
+    if args.tail_days is not None:
+        cutoff  = (date.today() - timedelta(days=args.tail_days)).strftime('%Y%m%d')
+        before  = len(records)
+        no_date = sum(1 for r in records if not _date(r))
+        records = [r for r in records if not _date(r) or _date(r) >= cutoff]
+        if no_date:
+            log.warning("%d QSO(s) had no QSO_DATE and were kept without "
+                        "--tail-days filtering", no_date)
+        log.verbose("--tail-days %d (cutoff %s): %d → %d records",
+                    args.tail_days, cutoff, before, len(records))
+
+    if args.tail is not None:
+        before  = len(records)
+        records = records[-args.tail:]
+        log.verbose("--tail %d: %d → %d records", args.tail, before, len(records))
+
+    if len(records) != original:
+        log.info("Date/count filters: %d → %d QSOs", original, len(records))
+
+    return records
 
 
 # --------------------------------------------------------------------------- #
@@ -767,6 +1226,9 @@ def parse_args():
             "  hamap contacts.adif --output map.png\n"
             "  hamap contacts.adif --preview\n"
             "  hamap contacts.adif --my-grid EN82\n"
+            "  hamap contacts.adif --start 2025-01-01 --end 2025-03-31\n"
+            "  hamap contacts.adif --tail-days 30\n"
+            "  hamap contacts.adif --tail 500\n"
             "  hamap --setup\n"
         ),
     )
@@ -790,6 +1252,25 @@ def parse_args():
                    help='Figure height in inches (default: 12)')
     p.add_argument('--setup', action='store_true',
                    help='Download offline map data to ~/.hamap/ and exit')
+    p.add_argument('--font-size', type=float, default=3.0, metavar='PT',
+                   help='Label font size in points (default: 3.0)')
+    p.add_argument('--truncate-grids', action='store_true',
+                   help='Reduce grid squares to 4-character accuracy before grouping')
+    p.add_argument('--label-countries', action='store_true',
+                   help='Draw country name labels at centroid positions')
+    p.add_argument('--label-states', action='store_true',
+                   help='Draw US state / Canadian province labels at centroid positions')
+
+    filt = p.add_argument_group('filtering')
+    filt.add_argument('--start', metavar='DATE', type=_parse_date_arg,
+                      help='Only include QSOs on or after DATE (YYYY-MM-DD or YYYYMMDD)')
+    filt.add_argument('--end', metavar='DATE', type=_parse_date_arg,
+                      help='Only include QSOs on or before DATE (YYYY-MM-DD or YYYYMMDD)')
+    tail_grp = filt.add_mutually_exclusive_group()
+    tail_grp.add_argument('--tail', metavar='N', type=int,
+                          help='Only process the last N QSOs (after date filters)')
+    tail_grp.add_argument('--tail-days', metavar='N', type=int,
+                          help='Only process QSOs from the last N days')
 
     verbosity = p.add_mutually_exclusive_group()
     verbosity.add_argument('--verbose', action='store_true',
@@ -825,6 +1306,12 @@ def main():
     # ---- Parse ADIF -------------------------------------------------------
     header, records = parse_adif(args.adif_file, log)
     log.info("Loaded %d QSO records from %s", len(records), args.adif_file)
+
+    # ---- Apply date / count filters ---------------------------------------
+    records = filter_records(records, args, log)
+    if not records:
+        log.error("No QSOs remain after filtering.")
+        sys.exit(1)
 
     # ---- Determine home station location ----------------------------------
     home_pos = None

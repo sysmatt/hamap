@@ -47,7 +47,17 @@ Options:
   --dpi N               Output DPI (default: 300)
   --width N             Figure width in inches (default: 24)
   --height N            Figure height in inches (default: 12)
+  --font-size PT        Label font size in points (default: 3.0)
+  --truncate-grids      Reduce grid squares to 4-char accuracy before grouping
+  --label-countries     Draw country name labels at their geographic centroids
+  --label-states        Draw US state / Canadian province labels at their centroids
   --setup               Download offline map data to ~/.hamap/ and exit
+
+Filtering (applied before rendering, in this order):
+  --start DATE          Only include QSOs on or after DATE (YYYY-MM-DD or YYYYMMDD)
+  --end DATE            Only include QSOs on or before DATE
+  --tail-days N         Only include QSOs from the last N days   [mutually exclusive]
+  --tail N              Only use the last N QSOs in the file      [mutually exclusive]
 
 Verbosity:
   --verbose / --debug / --trace
@@ -60,6 +70,15 @@ Verbosity:
 ```bash
 # Save map alongside the ADIF file
 ./hamap wsjtx_log.adi
+
+# Only QSOs from a specific date range
+./hamap wsjtx_log.adi --start 2025-01-01 --end 2025-03-31
+
+# Last 30 days of activity
+./hamap wsjtx_log.adi --tail-days 30
+
+# Only the most recent 500 log entries
+./hamap wsjtx_log.adi --tail 500
 
 # Custom output path
 ./hamap wsjtx_log.adi --output ~/Desktop/contacts.png
