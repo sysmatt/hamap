@@ -3,8 +3,6 @@
 
 import argparse
 import configparser
-import html as _html
-import json
 import logging
 import logging.handlers
 import math
@@ -1152,158 +1150,208 @@ def generate_map(qsos_with_pos, home_pos, args, log):
 
 
 # --------------------------------------------------------------------------- #
-# HTML export
+# HTML export  (Plotly interactive map)
 # --------------------------------------------------------------------------- #
 
-def generate_html(groups, args, img_path, out_path, log):
+def _great_circle_path(lat1, lon1, lat2, lon2, n=50):
+    """Return (lats, lons) lists interpolating a great-circle arc."""
+    phi1, lam1 = math.radians(lat1), math.radians(lon1)
+    phi2, lam2 = math.radians(lat2), math.radians(lon2)
+    d = 2.0 * math.asin(math.sqrt(
+        math.sin((phi2 - phi1) / 2.0) ** 2 +
+        math.cos(phi1) * math.cos(phi2) * math.sin((lam2 - lam1) / 2.0) ** 2
+    ))
+    if d < 1e-8:
+        return [lat1, lat2], [lon1, lon2]
+    lats, lons = [], []
+    for i in range(n + 1):
+        f  = i / n
+        A  = math.sin((1.0 - f) * d) / math.sin(d)
+        B  = math.sin(f * d) / math.sin(d)
+        x  = A * math.cos(phi1) * math.cos(lam1) + B * math.cos(phi2) * math.cos(lam2)
+        y  = A * math.cos(phi1) * math.sin(lam1) + B * math.cos(phi2) * math.sin(lam2)
+        z  = A * math.sin(phi1) + B * math.sin(phi2)
+        lats.append(math.degrees(math.atan2(z, math.sqrt(x * x + y * y))))
+        lons.append(math.degrees(math.atan2(y, x)))
+    return lats, lons
+
+
+def generate_html_plotly(groups, args, home_pos, out_path, log):
     """
-    Write an HTML file that shows the PNG map with interactive hover popups
-    for each contact group.  Dot positions are computed from the same
-    _AX_RECT / PlateCarree linear mapping used by the placer, so the HTML
-    overlays line up with the saved PNG (which must be saved without
-    bbox_inches='tight' for exact alignment).
+    Write a fully self-contained interactive HTML map using Plotly.
+    Zoomable, pannable, with hover popups per contact group.
+    Great-circle lines are true geodesics interpolated with _great_circle_path.
     """
-    left, bottom, ax_w, ax_h = _AX_RECT
+    try:
+        import plotly.graph_objects as go
+    except ImportError:
+        log.error("plotly is required for --html.  Install: pip install plotly")
+        return
 
-    def _ll_to_pct(lon, lat):
-        """Return CSS left%, top% for a lat/lon point."""
-        x = (left + (lon + 180.0) / 360.0 * ax_w) * 100.0
-        # matplotlib Y=0 is bottom; HTML Y=0 is top
-        y = (1.0 - bottom - (lat + 90.0) / 180.0 * ax_h) * 100.0
-        return x, y
+    # ── Great-circle lines, one aggregated trace per band ────────────────────
+    line_traces = []
+    if home_pos and not args.no_lines:
+        home_lat, home_lon = home_pos
+        by_band_lines = defaultdict(lambda: {'lats': [], 'lons': []})
+        for info in groups.values():
+            band = Counter(qso.get('BAND', '?').lower()
+                           for qso in info['qsos']).most_common(1)[0][0]
+            gc_lats, gc_lons = _great_circle_path(
+                home_lat, home_lon, info['dot_lat'], info['dot_lon'])
+            by_band_lines[band]['lats'].extend(gc_lats + [None])
+            by_band_lines[band]['lons'].extend(gc_lons + [None])
 
-    img_rel = os.path.relpath(img_path, os.path.dirname(os.path.abspath(out_path)))
+        for band in sorted(by_band_lines, key=_band_sort_key):
+            d = by_band_lines[band]
+            line_traces.append(go.Scattergeo(
+                lat=d['lats'], lon=d['lons'],
+                mode='lines',
+                line=dict(width=0.6, color=BAND_COLORS.get(band, UNKNOWN_COLOR)),
+                opacity=0.18,
+                showlegend=False,
+                hoverinfo='skip',
+            ))
 
-    # ── Build per-group data ─────────────────────────────────────────────────
-    dot_data = []
-    for key, info in groups.items():
-        x_pct, y_pct = _ll_to_pct(info['dot_lon'], info['dot_lat'])
+    # ── Contact dots, one trace per band (drives the legend) ─────────────────
+    by_band_dots = defaultdict(lambda: {'lats': [], 'lons': [], 'hovers': []})
+    for info in groups.values():
         calls = sorted({qso.get('CALL', '') for qso in info['qsos']})
-
         band_counts = Counter(qso.get('BAND', '?').lower() for qso in info['qsos'])
+        top_band    = band_counts.most_common(1)[0][0]
+
         bands_str = ' · '.join(
             f"{b}×{n}" if n > 1 else b
-            for b, n in sorted(band_counts.items(), key=lambda kv: _band_sort_key(kv[0]))
+            for b, n in sorted(band_counts.items(),
+                               key=lambda kv: _band_sort_key(kv[0]))
         )
-
         dates = sorted({qso.get('QSO_DATE', '') for qso in info['qsos']
                         if qso.get('QSO_DATE')})
-        if len(dates) > 1:
-            date_str = f"{_fmt_date(dates[0])} – {_fmt_date(dates[-1])}"
-        elif dates:
-            date_str = _fmt_date(dates[0])
-        else:
-            date_str = ''
-
+        date_str = (f"{_fmt_date(dates[0])} – {_fmt_date(dates[-1])}"
+                    if len(dates) > 1 else _fmt_date(dates[0]) if dates else '')
         countries = sorted({qso.get('COUNTRY', '') for qso in info['qsos']
                             if qso.get('COUNTRY')})
-        country_str = ', '.join(countries[:4])
 
-        dot_data.append({
-            'x': round(x_pct, 4),
-            'y': round(y_pct, 4),
-            'color': info['color'],
-            'header': info['label_header'],
-            'calls': calls,
-            'bands': bands_str,
-            'date': date_str,
-            'country': country_str,
-            'n': len(info['qsos']),
-        })
+        n_qso = len(info['qsos'])
+        hover = (
+            f"<b style='color:{info['color']}'>{info['label_header']}</b>"
+            f"  <span style='color:#8899aa'>"
+            f"{n_qso} QSO{'s' if n_qso != 1 else ''}</span><br>"
+        )
+        if bands_str:
+            hover += f"<span style='color:#8899aa'>Band: {bands_str}</span><br>"
+        if date_str:
+            hover += f"<span style='color:#8899aa'>{date_str}</span><br>"
+        if countries:
+            hover += f"<span style='color:#8899aa'>{', '.join(countries[:3])}</span><br>"
+        hover += '<br>'.join(calls)
 
-    dots_json = json.dumps(dot_data, separators=(',', ':'))
+        by_band_dots[top_band]['lats'].append(info['dot_lat'])
+        by_band_dots[top_band]['lons'].append(info['dot_lon'])
+        by_band_dots[top_band]['hovers'].append(hover)
 
-    # ── HTML template ────────────────────────────────────────────────────────
-    title = _html.escape(os.path.basename(img_path))
-    html_out = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>hamap — {title}</title>
-<style>
-*{{box-sizing:border-box;margin:0;padding:0}}
-body{{background:#0d1b2a;display:flex;justify-content:center;align-items:flex-start;min-height:100vh}}
-.wrap{{position:relative;width:100%;max-width:100vw;line-height:0}}
-.wrap img{{width:100%;display:block}}
-.dot{{
-  position:absolute;
-  width:10px;height:10px;
-  border-radius:50%;
-  transform:translate(-50%,-50%);
-  cursor:pointer;
-  opacity:.85;
-  transition:transform .1s,opacity .1s;
-}}
-.dot:hover{{opacity:1;transform:translate(-50%,-50%) scale(2);z-index:5}}
-#pop{{
-  display:none;
-  position:fixed;
-  background:#0d1b2a;
-  border:1px solid #3a5a7a;
-  border-radius:4px;
-  padding:7px 10px;
-  font-family:monospace;
-  font-size:12px;
-  color:#c8d8e8;
-  z-index:100;
-  max-width:280px;
-  max-height:320px;
-  overflow-y:auto;
-  pointer-events:none;
-  box-shadow:0 3px 12px rgba(0,0,0,.7);
-}}
-.ph{{font-size:13px;font-weight:bold;padding-bottom:4px;margin-bottom:4px;border-bottom:1px solid #3a5a7a}}
-.pm{{color:#8899aa;font-size:11px;margin-bottom:2px}}
-.pc{{margin-top:5px;columns:2;column-gap:6px}}
-.pc span{{display:block;color:#c8d8e8;line-height:1.5;break-inside:avoid}}
-</style>
-</head>
-<body>
-<div class="wrap">
-  <img src="{_html.escape(img_rel, quote=True)}" alt="hamap contact map">
-</div>
-<div id="pop"></div>
-<script>
-const DOTS={dots_json};
-const pop=document.getElementById('pop');
-const wrap=document.querySelector('.wrap');
-DOTS.forEach(d=>{{
-  const el=document.createElement('div');
-  el.className='dot';
-  el.style.left=d.x+'%';
-  el.style.top=d.y+'%';
-  el.style.background=d.color;
-  el.addEventListener('mouseenter',e=>{{showpop(d,e)}});
-  el.addEventListener('mousemove',movepop);
-  el.addEventListener('mouseleave',()=>{{pop.style.display='none'}});
-  wrap.appendChild(el);
-}});
-function showpop(d,e){{
-  const qso=d.n===1?'1 QSO':d.n+' QSOs';
-  let h=`<div class="ph" style="color:${{d.color}}">${{esc(d.header)}} <span style="color:#8899aa;font-weight:normal">${{qso}}</span></div>`;
-  if(d.bands) h+=`<div class="pm">Band: ${{esc(d.bands)}}</div>`;
-  if(d.date)  h+=`<div class="pm">Date: ${{esc(d.date)}}</div>`;
-  if(d.country) h+=`<div class="pm">${{esc(d.country)}}</div>`;
-  h+=`<div class="pc">${{d.calls.map(c=>`<span>${{esc(c)}}</span>`).join('')}}</div>`;
-  pop.innerHTML=h;
-  pop.style.display='block';
-  movepop(e);
-}}
-function movepop(e){{
-  const x=e.clientX+16,y=e.clientY+16;
-  pop.style.left=(x+pop.offsetWidth >window.innerWidth ?e.clientX-pop.offsetWidth-6:x)+'px';
-  pop.style.top =(y+pop.offsetHeight>window.innerHeight?e.clientY-pop.offsetHeight-6:y)+'px';
-}}
-function esc(s){{
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-}}
-</script>
-</body>
-</html>"""
+    dot_traces = []
+    for band in sorted(by_band_dots, key=_band_sort_key):
+        d     = by_band_dots[band]
+        color = BAND_COLORS.get(band, UNKNOWN_COLOR)
+        dot_traces.append(go.Scattergeo(
+            lat=d['lats'], lon=d['lons'],
+            mode='markers',
+            marker=dict(size=6, color=color, opacity=0.9,
+                        line=dict(width=0.5, color=color)),
+            customdata=d['hovers'],
+            hovertemplate='%{customdata}<extra></extra>',
+            name=band,
+            legendgroup=band,
+        ))
 
-    with open(out_path, 'w', encoding='utf-8') as f:
-        f.write(html_out)
+    # ── Home station ──────────────────────────────────────────────────────────
+    home_traces = []
+    if home_pos:
+        home_lat, home_lon = home_pos
+        home_traces = [go.Scattergeo(
+            lat=[home_lat], lon=[home_lon],
+            mode='markers',
+            marker=dict(size=14, symbol='star', color='#FFFF00',
+                        line=dict(color='#FF8800', width=1)),
+            name='Home',
+            hovertemplate='Home station<extra></extra>',
+        )]
+
+    # ── Optional text label traces ────────────────────────────────────────────
+    label_traces = []
+    if args.label_countries:
+        label_traces.append(go.Scattergeo(
+            lat=[v[0] for v in COUNTRY_CENTROIDS.values()],
+            lon=[v[1] for v in COUNTRY_CENTROIDS.values()],
+            text=list(COUNTRY_CENTROIDS.keys()),
+            mode='text',
+            textfont=dict(size=8, color='#7a9aaa', family='monospace'),
+            hoverinfo='skip', showlegend=False,
+        ))
+    if args.label_states:
+        label_traces.append(go.Scattergeo(
+            lat=[v[0] for v in STATE_CENTROIDS.values()],
+            lon=[v[1] for v in STATE_CENTROIDS.values()],
+            text=list(STATE_CENTROIDS.keys()),
+            mode='text',
+            textfont=dict(size=7, color='#8899aa', family='monospace'),
+            hoverinfo='skip', showlegend=False,
+        ))
+
+    # ── Assemble figure ───────────────────────────────────────────────────────
+    fig = go.Figure(data=line_traces + dot_traces + home_traces + label_traces)
+
+    fig.update_geos(
+        projection_type='natural earth',
+        showland=True,        landcolor='#1e3a1e',
+        showocean=True,       oceancolor='#0d1b2a',
+        showlakes=True,       lakecolor='#0d1b2a',
+        showrivers=False,
+        showcoastlines=True,  coastlinecolor='#3a7a3a', coastlinewidth=0.5,
+        showcountries=True,   countrycolor='#2a5a2a',   countrywidth=0.3,
+        showsubunits=args.label_states,
+        subunitcolor='#4a7a4a', subunitwidth=0.3,
+        bgcolor='#0d1b2a',
+        lataxis=dict(showgrid=True, gridcolor='#1e3050', dtick=30),
+        lonaxis=dict(showgrid=True, gridcolor='#1e3050', dtick=30),
+    )
+
+    total     = sum(len(info['qsos']) for info in groups.values())
+    unique_cs = len({qso.get('CALL', '')
+                     for info in groups.values() for qso in info['qsos']})
+
+    fig.update_layout(
+        paper_bgcolor='#0d1b2a',
+        margin=dict(l=0, r=0, t=0, b=0),
+        legend=dict(
+            x=1, y=0, xanchor='right', yanchor='bottom',
+            bgcolor='rgba(13,27,42,0.85)',
+            bordercolor='#334455', borderwidth=1,
+            font=dict(color='white', size=10, family='monospace'),
+            title=dict(text='Band', font=dict(color='#8899aa', size=10)),
+        ),
+        hoverlabel=dict(
+            bgcolor='#0d1b2a', bordercolor='#3a5a7a', align='left',
+            font=dict(family='monospace', size=12, color='#c8d8e8'),
+        ),
+        annotations=[dict(
+            text=(f"Contacts: {total:,}  |  Grids: {len(groups):,}"
+                  f"  |  Callsigns: {unique_cs:,}"),
+            xref='paper', yref='paper',
+            x=0.01, y=0.02, xanchor='left', yanchor='bottom',
+            showarrow=False,
+            font=dict(family='monospace', size=10, color='#c8d8e8'),
+            bgcolor='rgba(13,27,42,0.85)',
+            bordercolor='#3a5a7a', borderwidth=1, borderpad=6,
+        )],
+    )
+
+    fig.write_html(
+        out_path,
+        include_plotlyjs=True,
+        config=dict(scrollZoom=True,
+                    modeBarButtonsToRemove=['select2d', 'lasso2d']),
+    )
     log.info("HTML saved: %s", out_path)
 
 
@@ -1535,17 +1583,13 @@ def main():
         plt.show()
     else:
         log.info("Saving to %s...", out_path)
-        # Skip bbox_inches='tight' when HTML is requested so that _AX_RECT
-        # fractions map exactly to pixel positions in the overlay.
-        tight = not args.html
-        fig.savefig(out_path, dpi=args.dpi,
-                    bbox_inches='tight' if tight else None,
+        fig.savefig(out_path, dpi=args.dpi, bbox_inches='tight',
                     facecolor=fig.get_facecolor())
         log.info("Saved: %s", out_path)
 
-        if args.html:
-            html_path = os.path.splitext(out_path)[0] + '.html'
-            generate_html(groups, args, out_path, html_path, log)
+    if args.html:
+        html_path = os.path.splitext(out_path)[0] + '.html'
+        generate_html_plotly(groups, args, home_pos, html_path, log)
 
     plt.close(fig)
 

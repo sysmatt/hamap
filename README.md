@@ -51,7 +51,7 @@ Options:
   --truncate-grids      Reduce grid squares to 4-char accuracy before grouping
   --label-countries     Draw country name labels at their geographic centroids
   --label-states        Draw US state / Canadian province labels at their centroids
-  --html                Also write an HTML file with interactive contact popups
+  --html                Also write a self-contained interactive HTML map (Plotly)
   --setup               Download offline map data to ~/.hamap/ and exit
 
 Filtering (applied before rendering, in this order):
