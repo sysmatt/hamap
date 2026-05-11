@@ -1297,6 +1297,32 @@ def generate_html_plotly(groups, args, home_pos, out_path, log):
             textfont=dict(size=14, color='#8899aa', family='monospace'),
             hoverinfo='skip', showlegend=False,
         ))
+        # Draw state/province borders from the cached Natural Earth shapefile
+        import cartopy.io.shapereader as shpreader
+        try:
+            shpfile = shpreader.natural_earth(
+                resolution='10m', category='cultural',
+                name='admin_1_states_provinces')
+            slats, slons = [], []
+            for record in shpreader.Reader(shpfile).records():
+                if record.attributes.get('admin') not in (
+                        'United States of America', 'Canada'):
+                    continue
+                geom = record.geometry
+                polys = (list(geom.geoms)
+                         if geom.geom_type == 'MultiPolygon' else [geom])
+                for poly in polys:
+                    xs, ys = poly.exterior.xy
+                    slons.extend(list(xs) + [None])
+                    slats.extend(list(ys) + [None])
+            if slats:
+                label_traces.append(go.Scattergeo(
+                    lat=slats, lon=slons, mode='lines',
+                    line=dict(width=0.6, color='#5aaa5a'),
+                    hoverinfo='skip', showlegend=False,
+                ))
+        except Exception as exc:
+            log.debug('State border shapefile unavailable: %s', exc)
 
     # ── Assemble figure ───────────────────────────────────────────────────────
     fig = go.Figure(data=line_traces + dot_traces + home_traces + label_traces)
@@ -1309,8 +1335,7 @@ def generate_html_plotly(groups, args, home_pos, out_path, log):
         showrivers=False,
         showcoastlines=True,  coastlinecolor='#3a7a3a', coastlinewidth=0.5,
         showcountries=True,   countrycolor='#4a9a4a',   countrywidth=0.7,
-        showsubunits=args.label_states,
-        subunitcolor='#5aaa5a', subunitwidth=0.6,
+        showsubunits=False,
         bgcolor='#0d1b2a',
         lataxis=dict(showgrid=True, gridcolor='#1e3050', dtick=30),
         lonaxis=dict(showgrid=True, gridcolor='#1e3050', dtick=30),
