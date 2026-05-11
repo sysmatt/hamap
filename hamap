@@ -1285,7 +1285,7 @@ def generate_html_plotly(groups, args, home_pos, out_path, log):
             lon=[v[1] for v in COUNTRY_CENTROIDS.values()],
             text=list(COUNTRY_CENTROIDS.keys()),
             mode='text',
-            textfont=dict(size=8, color='#7a9aaa', family='monospace'),
+            textfont=dict(size=16, color='#7a9aaa', family='monospace'),
             hoverinfo='skip', showlegend=False,
         ))
     if args.label_states:
@@ -1294,7 +1294,7 @@ def generate_html_plotly(groups, args, home_pos, out_path, log):
             lon=[v[1] for v in STATE_CENTROIDS.values()],
             text=list(STATE_CENTROIDS.keys()),
             mode='text',
-            textfont=dict(size=7, color='#8899aa', family='monospace'),
+            textfont=dict(size=14, color='#8899aa', family='monospace'),
             hoverinfo='skip', showlegend=False,
         ))
 
@@ -1308,9 +1308,9 @@ def generate_html_plotly(groups, args, home_pos, out_path, log):
         showlakes=True,       lakecolor='#0d1b2a',
         showrivers=False,
         showcoastlines=True,  coastlinecolor='#3a7a3a', coastlinewidth=0.5,
-        showcountries=True,   countrycolor='#2a5a2a',   countrywidth=0.3,
+        showcountries=True,   countrycolor='#4a9a4a',   countrywidth=0.7,
         showsubunits=args.label_states,
-        subunitcolor='#4a7a4a', subunitwidth=0.3,
+        subunitcolor='#5aaa5a', subunitwidth=0.6,
         bgcolor='#0d1b2a',
         lataxis=dict(showgrid=True, gridcolor='#1e3050', dtick=30),
         lonaxis=dict(showgrid=True, gridcolor='#1e3050', dtick=30),
