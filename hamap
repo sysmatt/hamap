@@ -1,0 +1,899 @@
+#!/usr/bin/env python3
+"""hamap - High-resolution ham radio contact map generator from ADIF logs."""
+
+import argparse
+import configparser
+import logging
+import logging.handlers
+import os
+import re
+import sys
+from collections import defaultdict
+
+# Set matplotlib backend before pyplot import; check argv directly so this
+# works regardless of import order.
+import matplotlib
+if '--preview' not in sys.argv:
+    matplotlib.use('Agg')
+
+HAMAP_DIR = os.path.expanduser('~/.hamap')
+
+# Redirect cartopy's data cache to ~/.hamap/cartopy before any cartopy
+# submodule is imported.
+os.makedirs(HAMAP_DIR, exist_ok=True)
+import cartopy                                    # noqa: E402  (must follow makedirs)
+cartopy.config['data_dir'] = os.path.join(HAMAP_DIR, 'cartopy')
+
+import cartopy.crs as ccrs                        # noqa: E402
+import cartopy.feature as cfeature                # noqa: E402
+import matplotlib.patches as mpatches             # noqa: E402
+import matplotlib.pyplot as plt                   # noqa: E402
+import matplotlib.ticker as mticker               # noqa: E402
+import numpy as np                                # noqa: E402
+
+
+# =============================================================================
+# BEGIN APPLOG
+# =============================================================================
+
+class AppLogger:
+    """
+    Application logger with TRACE/VERBOSE/DEBUG/INFO levels and configurable destinations.
+
+    Custom levels:
+        TRACE   =  5   super-verbose full dumps
+        VERBOSE = 15   informative detail beyond normal INFO
+
+    Destinations: console stream (stderr by default), log file, syslog.
+    Console output: plain message for INFO, [LEVEL] prefix for all other levels.
+    File/syslog output: includes program name, timestamp, and level.
+
+    Construction:
+        log = AppLogger("myprog", level=AppLogger.VERBOSE)
+        log = AppLogger.from_args(args, "myprog")
+        log = AppLogger.from_args(args, "myprog", cfg=config)  # args > cfg > defaults
+
+    Config file ([logging] section):
+        [logging]
+        level   = verbose    # trace | debug | verbose | info
+        logfile = /path/to/myprog.log
+        syslog  = false
+    """
+
+    TRACE   = 5
+    VERBOSE = 15
+
+    # Register custom levels at class-definition time
+    logging.addLevelName(TRACE,   "TRACE")
+    logging.addLevelName(VERBOSE, "VERBOSE")
+
+    # Inject .trace() and .verbose() into logging.Logger
+    def _trace_m(self, msg, *a, **kw):
+        if self.isEnabledFor(5):  self._log(5,  msg, a, **kw)
+    def _verbose_m(self, msg, *a, **kw):
+        if self.isEnabledFor(15): self._log(15, msg, a, **kw)
+    logging.Logger.trace   = _trace_m
+    logging.Logger.verbose = _verbose_m
+    del _trace_m, _verbose_m
+
+    class _ConsoleFormatter(logging.Formatter):
+        """Plain message for INFO; [LEVEL] prefix for everything else."""
+        def __init__(self, plain_levels=None):
+            super().__init__()
+            self._plain = frozenset(plain_levels if plain_levels is not None else [logging.INFO])
+
+        def format(self, record):
+            msg = record.getMessage()
+            if record.levelno not in self._plain:
+                msg = f"[{record.levelname}] {msg}"
+            if record.exc_info:
+                if not record.exc_text:
+                    record.exc_text = self.formatException(record.exc_info)
+            if record.exc_text:
+                msg = f"{msg}\n{record.exc_text}"
+            return msg
+
+    def __init__(
+        self,
+        name: str,
+        level: int = logging.INFO,
+        *,
+        stream=sys.stderr,
+        logfile: str | None = None,
+        use_syslog: bool = False,
+        plain_levels: list[int] | None = None,
+    ):
+        self._logger = logging.getLogger(name)
+        self._logger.setLevel(level)
+        self._logger.handlers.clear()
+        self._logger.propagate = False
+
+        if stream is not None:
+            h = logging.StreamHandler(stream)
+            h.setLevel(level)
+            h.setFormatter(self._ConsoleFormatter(plain_levels=plain_levels))
+            self._logger.addHandler(h)
+
+        if logfile:
+            h = logging.FileHandler(logfile, encoding="utf-8")
+            h.setLevel(level)
+            h.setFormatter(logging.Formatter(
+                fmt=f"%(asctime)s {name} [%(levelname)s] %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            ))
+            self._logger.addHandler(h)
+
+        if use_syslog:
+            address = "/dev/log" if os.path.exists("/dev/log") else ("localhost", 514)
+            h = logging.handlers.SysLogHandler(address=address)
+            h.setLevel(level)
+            h.setFormatter(logging.Formatter(f"{name}: [%(levelname)s] %(message)s"))
+            self._logger.addHandler(h)
+
+    @classmethod
+    def from_args(
+        cls,
+        args,
+        program_name: str,
+        cfg: configparser.ConfigParser | None = None,
+        **kwargs,
+    ) -> "AppLogger":
+        """
+        Build from an argparse Namespace, optionally merging a ConfigParser.
+        Args take precedence over the [logging] config section.
+        """
+        _lvl = {"trace": cls.TRACE, "debug": logging.DEBUG,
+                "verbose": cls.VERBOSE, "info": logging.INFO}
+
+        cfg_level   = _lvl.get((cfg.get("logging", "level", fallback="") if cfg else "").lower(), logging.INFO)
+        cfg_logfile = cfg.get("logging", "logfile", fallback=None)        if cfg else None
+        cfg_syslog  = cfg.getboolean("logging", "syslog", fallback=False) if cfg else False
+
+        if   getattr(args, "trace",   False): level = cls.TRACE
+        elif getattr(args, "debug",   False): level = logging.DEBUG
+        elif getattr(args, "verbose", False): level = cls.VERBOSE
+        else:                                 level = cfg_level
+
+        logfile    = getattr(args, "logfile", None) or cfg_logfile
+        use_syslog = getattr(args, "syslog", False) or cfg_syslog
+
+        return cls(name=program_name, level=level, logfile=logfile, use_syslog=use_syslog, **kwargs)
+
+    def trace(self,   msg, *a, **kw): self._logger.trace(msg,   *a, **kw)
+    def verbose(self, msg, *a, **kw): self._logger.verbose(msg, *a, **kw)
+    def debug(self,   msg, *a, **kw): self._logger.debug(msg,   *a, **kw)
+    def info(self,    msg, *a, **kw): self._logger.info(msg,    *a, **kw)
+    def warning(self, msg, *a, **kw): self._logger.warning(msg, *a, **kw)
+    def error(self,   msg, *a, **kw): self._logger.error(msg,   *a, **kw)
+    def critical(self,msg, *a, **kw): self._logger.critical(msg,*a, **kw)
+
+# =============================================================================
+# END APPLOG
+# =============================================================================
+
+
+# --------------------------------------------------------------------------- #
+# Band → colour mapping
+# --------------------------------------------------------------------------- #
+
+BAND_COLORS = {
+    '160m': '#CC0000',
+    '80m':  '#FF4400',
+    '60m':  '#FF6600',
+    '40m':  '#FF9900',
+    '30m':  '#FFCC00',
+    '20m':  '#33CC33',
+    '17m':  '#00CCBB',
+    '15m':  '#3399FF',
+    '12m':  '#8844FF',
+    '10m':  '#CC00FF',
+    '6m':   '#FF00CC',
+    '4m':   '#FF66CC',
+    '2m':   '#FF99DD',
+    '70cm': '#AAAAAA',
+    '23cm': '#CCCCCC',
+}
+UNKNOWN_COLOR = '#FFFF44'
+
+_BAND_ORDER = ['160m', '80m', '60m', '40m', '30m', '20m', '17m', '15m',
+               '12m', '10m', '6m', '4m', '2m', '70cm', '23cm']
+
+
+def _band_sort_key(band):
+    try:
+        return _BAND_ORDER.index(band)
+    except ValueError:
+        return 999
+
+
+# --------------------------------------------------------------------------- #
+# Built-in country centroid lookup (lat, lon) — fallback when no grid square
+# --------------------------------------------------------------------------- #
+
+COUNTRY_CENTROIDS = {
+    # North America
+    'United States':       (39.50, -98.35),
+    'Canada':              (60.00, -95.00),
+    'Mexico':              (23.60, -102.50),
+    # Central America / Caribbean
+    'Cuba':                (22.00,  -79.50),
+    'Jamaica':             (18.10,  -77.30),
+    'Puerto Rico':         (18.20,  -66.50),
+    'Costa Rica':          ( 9.70,  -83.70),
+    'Panama':              ( 8.50,  -80.00),
+    'Guatemala':           (15.80,  -90.20),
+    'Honduras':            (15.20,  -86.20),
+    'Nicaragua':           (12.90,  -85.20),
+    'El Salvador':         (13.80,  -88.90),
+    'Belize':              (17.20,  -88.50),
+    'Bahamas':             (25.00,  -77.40),
+    'Dominican Republic':  (18.70,  -70.20),
+    'Haiti':               (19.00,  -72.30),
+    'Trinidad and Tobago': (10.70,  -61.20),
+    'Barbados':            (13.20,  -59.50),
+    'Cayman Islands':      (19.30,  -81.40),
+    'Guadeloupe':          (16.30,  -61.40),
+    'Martinique':          (14.60,  -61.00),
+    'Bermuda':             (32.30,  -64.80),
+    'Aruba':               (12.50,  -70.00),
+    'Curacao':             (12.20,  -68.90),
+    'Virgin Islands':      (18.35,  -64.85),
+    # South America
+    'Brazil':              (-10.00,  -53.00),
+    'Argentina':           (-34.00,  -64.00),
+    'Chile':               (-30.00,  -71.00),
+    'Colombia':            (  4.00,  -73.00),
+    'Peru':                (-10.00,  -76.00),
+    'Venezuela':           (  8.00,  -66.00),
+    'Bolivia':             (-17.00,  -65.00),
+    'Ecuador':             ( -2.00,  -77.50),
+    'Paraguay':            (-23.30,  -58.20),
+    'Uruguay':             (-33.00,  -56.00),
+    'Guyana':              (  5.00,  -59.00),
+    'Suriname':            (  4.00,  -56.00),
+    'French Guiana':       (  4.00,  -53.00),
+    # Europe
+    'England':             ( 52.50,   -1.50),
+    'United Kingdom':      ( 54.00,   -2.50),
+    'Scotland':            ( 56.50,   -4.00),
+    'Wales':               ( 52.30,   -3.50),
+    'Northern Ireland':    ( 54.70,   -6.50),
+    'Ireland':             ( 53.00,   -8.00),
+    'France':              ( 46.00,    2.00),
+    'Germany':             ( 51.00,   10.00),
+    'Italy':               ( 42.80,   12.80),
+    'Spain':               ( 40.00,   -3.70),
+    'Portugal':            ( 39.50,   -8.00),
+    'Netherlands':         ( 52.30,    5.30),
+    'Belgium':             ( 50.80,    4.50),
+    'Switzerland':         ( 47.00,    8.20),
+    'Austria':             ( 47.50,   14.00),
+    'Sweden':              ( 62.00,   15.00),
+    'Norway':              ( 65.00,   13.00),
+    'Finland':             ( 64.00,   26.00),
+    'Denmark':             ( 56.00,   10.00),
+    'Poland':              ( 52.00,   20.00),
+    'Czech Republic':      ( 49.80,   15.50),
+    'Slovakia':            ( 48.70,   19.70),
+    'Hungary':             ( 47.20,   19.40),
+    'Romania':             ( 45.90,   25.00),
+    'Bulgaria':            ( 42.70,   25.50),
+    'Greece':              ( 39.00,   22.00),
+    'Turkey':              ( 39.00,   35.00),
+    'Ukraine':             ( 49.00,   32.00),
+    'Russia':              ( 60.00,  100.00),
+    'European Russia':     ( 58.00,   40.00),
+    'Asiatic Russia':      ( 60.00,  100.00),
+    'Belarus':             ( 53.70,   28.00),
+    'Serbia':              ( 44.00,   21.00),
+    'Croatia':             ( 45.10,   15.20),
+    'Slovenia':            ( 46.10,   14.80),
+    'Bosnia and Herzegovina': (44.20, 17.90),
+    'Montenegro':          ( 42.70,   19.40),
+    'North Macedonia':     ( 41.60,   21.70),
+    'Albania':             ( 41.20,   20.20),
+    'Kosovo':              ( 42.60,   21.10),
+    'Lithuania':           ( 56.00,   24.00),
+    'Latvia':              ( 57.00,   25.00),
+    'Estonia':             ( 58.60,   25.00),
+    'Luxembourg':          ( 49.80,    6.10),
+    'Iceland':             ( 65.00,  -18.00),
+    'Malta':               ( 35.90,   14.50),
+    'Cyprus':              ( 35.10,   33.40),
+    'San Marino':          ( 43.90,   12.50),
+    'Andorra':             ( 42.50,    1.50),
+    'Monaco':              ( 43.70,    7.40),
+    'Liechtenstein':       ( 47.10,    9.50),
+    'Vatican City':        ( 41.90,   12.45),
+    'Moldova':             ( 47.40,   28.50),
+    'Faroe Islands':       ( 62.00,   -6.80),
+    'Azores':              ( 38.50,  -28.00),
+    'Canary Islands':      ( 28.30,  -15.50),
+    'Madeira':             ( 32.80,  -17.00),
+    'Gibraltar':           ( 36.14,   -5.35),
+    # Asia
+    'Japan':               ( 36.20,  138.30),
+    'China':               ( 35.00,  103.00),
+    'India':               ( 20.60,   79.00),
+    'South Korea':         ( 37.00,  127.50),
+    'North Korea':         ( 40.00,  127.00),
+    'Taiwan':              ( 23.70,  121.00),
+    'Hong Kong':           ( 22.40,  114.10),
+    'Macau':               ( 22.20,  113.50),
+    'Indonesia':           ( -5.00,  120.00),
+    'Philippines':         ( 13.00,  122.00),
+    'Thailand':            ( 15.00,  101.00),
+    'Vietnam':             ( 16.00,  108.00),
+    'Malaysia':            (  3.00,  109.00),
+    'Singapore':           (  1.30,  103.80),
+    'Bangladesh':          ( 23.70,   90.40),
+    'Pakistan':            ( 30.00,   69.00),
+    'Sri Lanka':           (  7.90,   80.70),
+    'Nepal':               ( 28.40,   84.10),
+    'Myanmar':             ( 17.00,   96.00),
+    'Cambodia':            ( 12.60,  104.90),
+    'Laos':                ( 18.20,  103.90),
+    'Afghanistan':         ( 34.50,   65.00),
+    'Iran':                ( 32.00,   53.70),
+    'Iraq':                ( 33.20,   43.70),
+    'Saudi Arabia':        ( 24.00,   45.00),
+    'Israel':              ( 31.50,   34.80),
+    'Jordan':              ( 31.00,   36.00),
+    'Lebanon':             ( 33.90,   35.50),
+    'Syria':               ( 35.00,   38.00),
+    'Kuwait':              ( 29.30,   47.70),
+    'United Arab Emirates': (24.00,   54.00),
+    'Qatar':               ( 25.30,   51.20),
+    'Bahrain':             ( 26.00,   50.60),
+    'Oman':                ( 21.00,   57.00),
+    'Yemen':               ( 15.50,   47.50),
+    'Kazakhstan':          ( 48.00,   68.00),
+    'Uzbekistan':          ( 41.40,   64.60),
+    'Kyrgyzstan':          ( 41.20,   74.80),
+    'Tajikistan':          ( 38.90,   71.30),
+    'Turkmenistan':        ( 39.00,   59.60),
+    'Mongolia':            ( 46.50,  103.50),
+    'Azerbaijan':          ( 40.30,   47.60),
+    'Georgia':             ( 42.00,   43.50),
+    'Armenia':             ( 40.10,   45.00),
+    'Maldives':            (  3.20,   73.20),
+    'Bhutan':              ( 27.50,   90.50),
+    'Brunei':              (  4.50,  114.70),
+    'East Timor':          ( -8.90,  125.70),
+    # Africa
+    'South Africa':        (-29.00,   25.10),
+    'Egypt':               ( 27.00,   30.00),
+    'Nigeria':             ( 10.00,    8.70),
+    'Ethiopia':            (  9.10,   40.50),
+    'Kenya':               (  0.00,   38.00),
+    'Tanzania':            ( -6.00,   35.00),
+    'Uganda':              (  1.40,   32.30),
+    'Algeria':             ( 28.00,    2.70),
+    'Morocco':             ( 32.00,   -5.00),
+    'Tunisia':             ( 34.00,    9.00),
+    'Libya':               ( 27.00,   17.00),
+    'Sudan':               ( 15.00,   30.00),
+    'South Sudan':         (  7.00,   30.00),
+    'Ghana':               (  7.90,   -1.00),
+    'Cameroon':            (  4.20,   12.40),
+    'Angola':              (-11.20,   17.90),
+    'Mozambique':          (-18.70,   35.50),
+    'Zimbabwe':            (-19.00,   29.90),
+    'Zambia':              (-13.10,   27.90),
+    'Botswana':            (-22.30,   24.70),
+    'Namibia':             (-22.60,   17.10),
+    'Madagascar':          (-20.00,   47.00),
+    'Democratic Republic of the Congo': (-2.90, 24.00),
+    'Congo':               ( -0.30,   15.80),
+    'Senegal':             ( 14.50,  -14.50),
+    'Mali':                ( 17.60,   -2.00),
+    'Niger':               ( 17.60,    8.10),
+    'Chad':                ( 15.50,   18.70),
+    'Somalia':             ( 10.00,   46.20),
+    'Rwanda':              ( -2.00,   29.90),
+    'Burundi':             ( -3.40,   29.90),
+    'Malawi':              (-13.30,   34.30),
+    'Liberia':             (  6.40,   -9.40),
+    'Sierra Leone':        (  8.50,  -11.80),
+    'Guinea':              ( 11.70,  -11.60),
+    "Cote d'Ivoire":       (  7.50,   -5.50),
+    'Ivory Coast':         (  7.50,   -5.50),
+    'Burkina Faso':        ( 12.40,   -1.60),
+    'Togo':                (  8.60,    0.80),
+    'Benin':               (  9.30,    2.30),
+    'Mauritania':          ( 20.30,  -10.90),
+    'Djibouti':            ( 11.80,   42.60),
+    'Eritrea':             ( 15.20,   39.80),
+    'Mozambique':          (-18.70,   35.50),
+    'Reunion':             (-21.10,   55.50),
+    'Mauritius':           (-20.20,   57.50),
+    'Seychelles':          ( -4.70,   55.50),
+    'Cape Verde':          ( 16.00,  -24.00),
+    'Sao Tome and Principe': (0.30,    6.70),
+    'Equatorial Guinea':   (  1.70,   10.30),
+    'Gabon':               ( -1.00,   11.80),
+    'Central African Republic': (7.00, 21.00),
+    # Oceania / Pacific
+    'Australia':           (-25.70,  134.50),
+    'New Zealand':         (-41.30,  173.30),
+    'Papua New Guinea':    ( -6.30,  143.90),
+    'Fiji':                (-18.00,  179.00),
+    'Solomon Islands':     ( -9.00,  160.00),
+    'Vanuatu':             (-16.00,  167.00),
+    'Samoa':               (-13.60, -172.40),
+    'American Samoa':      (-14.30, -170.70),
+    'Tonga':               (-20.00, -175.00),
+    'Guam':                ( 13.50,  144.80),
+    'Hawaii':              ( 20.50, -157.00),
+    'New Caledonia':       (-21.30,  165.60),
+    'French Polynesia':    (-17.70, -149.40),
+    'Marshall Islands':    (  7.10,  171.10),
+    'Micronesia':          (  7.40,  150.60),
+    'Palau':               (  7.50,  134.60),
+    'Kiribati':            (  1.90,  -157.40),
+    'Nauru':               ( -0.50,  166.90),
+    'Tuvalu':              ( -8.50,  179.20),
+    'Cook Islands':        (-21.20, -159.80),
+    'Niue':                (-19.10, -169.90),
+}
+
+
+# --------------------------------------------------------------------------- #
+# ADIF parsing
+# --------------------------------------------------------------------------- #
+
+def _parse_adif_fields(text):
+    """Extract {NAME: value} pairs from a block of ADIF text."""
+    fields = {}
+    pat = re.compile(r'<([^:>]+):(\d+)(?::[^>]*)?>', re.IGNORECASE)
+    pos = 0
+    while pos < len(text):
+        m = pat.search(text, pos)
+        if not m:
+            break
+        name = m.group(1).upper()
+        length = int(m.group(2))
+        start = m.end()
+        value = text[start:start + length].strip()
+        if value and name not in ('EOR', 'EOH'):
+            fields[name] = value
+        pos = start + length
+    return fields
+
+
+def parse_adif(path, log):
+    """Return (header_fields, [qso_records]) from an ADIF file."""
+    try:
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            text = f.read()
+    except FileNotFoundError:
+        log.error("File not found: %s", path)
+        sys.exit(1)
+
+    eoh = text.upper().find('<EOH>')
+    if eoh != -1:
+        header_text = text[:eoh]
+        body_text = text[eoh + 5:]
+    else:
+        header_text = ''
+        body_text = text
+
+    header = _parse_adif_fields(header_text)
+
+    records = []
+    for chunk in re.split(r'<EOR>', body_text, flags=re.IGNORECASE):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        fields = _parse_adif_fields(chunk)
+        if fields.get('CALL'):
+            records.append(fields)
+
+    log.verbose("Parsed %d QSO records from %s", len(records), path)
+    return header, records
+
+
+# --------------------------------------------------------------------------- #
+# Location resolution
+# --------------------------------------------------------------------------- #
+
+def maidenhead_to_latlon(grid):
+    """Convert a Maidenhead locator (4 or 6 chars) to (lat, lon) centre."""
+    if not grid or len(grid) < 4:
+        return None
+    g = grid.upper().strip()
+    if not re.match(r'^[A-R]{2}[0-9]{2}', g):
+        return None
+
+    lon = (ord(g[0]) - ord('A')) * 20.0 - 180.0
+    lat = (ord(g[1]) - ord('A')) * 10.0 - 90.0
+    lon += int(g[2]) * 2.0
+    lat += int(g[3]) * 1.0
+
+    if len(g) >= 6 and g[4].isalpha() and g[5].isalpha():
+        lon += (ord(g[4].upper()) - ord('A')) * (2.0 / 24.0)
+        lat += (ord(g[5].upper()) - ord('A')) * (1.0 / 24.0)
+        lon += 1.0 / 24.0     # centre of subsquare
+        lat += 0.5 / 24.0
+    else:
+        lon += 1.0             # centre of 2° × 1° square
+        lat += 0.5
+
+    return (lat, lon)
+
+
+def _country_centroid(name):
+    if not name:
+        return None
+    direct = COUNTRY_CENTROIDS.get(name)
+    if direct:
+        return direct
+    name_lower = name.lower()
+    for k, v in COUNTRY_CENTROIDS.items():
+        if k.lower() == name_lower:
+            return v
+    return None
+
+
+def resolve_location(qso, log):
+    """Return (lat, lon) for a QSO record, or None if unresolvable."""
+    # 1. Explicit numeric lat/lon fields
+    lat_s = qso.get('LAT', '')
+    lon_s = qso.get('LON', '')
+    if lat_s and lon_s:
+        try:
+            # ADIF LAT/LON use 'N'/'S' and 'E'/'W' prefix: e.g. N043 123.456
+            def _parse_coord(s):
+                s = s.strip()
+                sign = -1 if s and s[0] in ('S', 'W') else 1
+                return sign * float(re.sub(r'^[NSEW]', '', s))
+            return (_parse_coord(lat_s), _parse_coord(lon_s))
+        except ValueError:
+            pass
+
+    # 2. Maidenhead grid square
+    grid = qso.get('GRIDSQUARE', '')
+    if grid:
+        pos = maidenhead_to_latlon(grid)
+        if pos:
+            return pos
+
+    # 3. Country centroid fallback
+    centroid = _country_centroid(qso.get('COUNTRY', ''))
+    if centroid:
+        return centroid
+
+    log.trace("No location for %s (grid=%r, country=%r)",
+              qso.get('CALL', '?'), grid, qso.get('COUNTRY', ''))
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# Offline data setup
+# --------------------------------------------------------------------------- #
+
+def do_setup(log):
+    """Pre-download all Natural Earth data needed for offline map rendering."""
+    log.info("Downloading Natural Earth map data to %s", HAMAP_DIR)
+    log.info("Requires an internet connection — this may take a few minutes.")
+
+    import cartopy.io.shapereader as shpreader
+
+    tasks = [
+        ('physical',  'land',              '10m'),
+        ('physical',  'ocean',             '10m'),
+        ('physical',  'coastline',         '10m'),
+        ('physical',  'lakes',             '10m'),
+        ('cultural',  'admin_0_countries', '10m'),
+        ('physical',  'land',              '110m'),
+        ('physical',  'ocean',             '110m'),
+        ('physical',  'coastline',         '110m'),
+        ('cultural',  'admin_0_countries', '110m'),
+    ]
+
+    ok = 0
+    for category, name, resolution in tasks:
+        log.info("  %s/%s @ %s ...", category, name, resolution)
+        try:
+            shpreader.natural_earth(resolution=resolution, category=category, name=name)
+            log.info("    cached")
+            ok += 1
+        except Exception as exc:
+            log.warning("    FAILED: %s", exc)
+
+    log.info("Setup complete: %d/%d datasets cached at %s",
+             ok, len(tasks), os.path.join(HAMAP_DIR, 'cartopy'))
+
+
+# --------------------------------------------------------------------------- #
+# Map generation
+# --------------------------------------------------------------------------- #
+
+_MAP_BG     = '#0d1b2a'    # deep navy — ocean / figure background
+_LAND_COLOR = '#1e3a1e'    # dark green land
+_COAST_CLR  = '#3a7a3a'    # coastline / border colour
+_GRID_CLR   = '#1e3050'    # graticule colour
+
+
+def generate_map(qsos_with_pos, home_pos, args, log):
+    """Build and return a matplotlib Figure containing the contact map."""
+    proj = ccrs.PlateCarree()
+    geodetic = ccrs.Geodetic()
+
+    fig = plt.figure(figsize=(args.width, args.height), facecolor=_MAP_BG)
+    ax = fig.add_axes([0.0, 0.04, 1.0, 0.92], projection=proj, facecolor=_MAP_BG)
+    ax.set_global()
+
+    # ---- Natural Earth background features --------------------------------
+    log.verbose("Loading map features...")
+    _land = cfeature.NaturalEarthFeature(
+        'physical', 'land', '10m', facecolor=_LAND_COLOR, edgecolor='none')
+    _ocean = cfeature.NaturalEarthFeature(
+        'physical', 'ocean', '10m', facecolor=_MAP_BG, edgecolor='none')
+    _coast = cfeature.NaturalEarthFeature(
+        'physical', 'coastline', '10m',
+        facecolor='none', edgecolor=_COAST_CLR, linewidth=0.35)
+    _borders = cfeature.NaturalEarthFeature(
+        'cultural', 'admin_0_countries', '10m',
+        facecolor='none', edgecolor='#2a5a2a', linewidth=0.20)
+    _lakes = cfeature.NaturalEarthFeature(
+        'physical', 'lakes', '10m',
+        facecolor=_MAP_BG, edgecolor=_COAST_CLR, linewidth=0.20)
+
+    ax.add_feature(_ocean)
+    ax.add_feature(_land)
+    ax.add_feature(_lakes)
+    ax.add_feature(_coast)
+    ax.add_feature(_borders)
+
+    # ---- Graticule --------------------------------------------------------
+    gl = ax.gridlines(linewidth=0.15, color=_GRID_CLR, alpha=0.8,
+                      linestyle='-', draw_labels=False)
+    gl.xlocator = mticker.MultipleLocator(30)
+    gl.ylocator = mticker.MultipleLocator(30)
+
+    # ---- Group by band ----------------------------------------------------
+    by_band = defaultdict(list)
+    for qso, (lat, lon) in qsos_with_pos:
+        band = qso.get('BAND', 'unknown').lower()
+        by_band[band].append((qso, lat, lon))
+
+    sorted_bands = sorted(by_band.keys(), key=_band_sort_key)
+
+    # ---- Great-circle lines -----------------------------------------------
+    if home_pos and not args.no_lines:
+        log.verbose("Drawing %d great-circle lines...", len(qsos_with_pos))
+        home_lat, home_lon = home_pos
+        for band in sorted_bands:
+            color = BAND_COLORS.get(band, UNKNOWN_COLOR)
+            for _qso, lat, lon in by_band[band]:
+                ax.plot(
+                    [home_lon, lon], [home_lat, lat],
+                    transform=geodetic,
+                    color=color, alpha=0.12, linewidth=0.4,
+                    solid_capstyle='round', zorder=3,
+                )
+
+    # ---- Contact dot markers ----------------------------------------------
+    log.verbose("Plotting contact markers...")
+    for band in sorted_bands:
+        color = BAND_COLORS.get(band, UNKNOWN_COLOR)
+        lats = [e[1] for e in by_band[band]]
+        lons = [e[2] for e in by_band[band]]
+        ax.scatter(lons, lats, transform=proj,
+                   s=8, color=color, alpha=0.85,
+                   linewidths=0, zorder=5)
+
+    # ---- Callsign labels --------------------------------------------------
+    if not args.no_labels:
+        unique_calls = len({e[0].get('CALL', '') for entries in by_band.values() for e in entries})
+        if unique_calls > 5000:
+            log.warning("Skipping labels: %d unique callsigns exceeds 5000 limit "
+                        "(use --no-labels to suppress this warning)", unique_calls)
+        else:
+            log.verbose("Adding labels for %d unique callsigns...", unique_calls)
+            seen = set()
+            for band in sorted_bands:
+                color = BAND_COLORS.get(band, UNKNOWN_COLOR)
+                for qso, lat, lon in by_band[band]:
+                    call = qso.get('CALL', '')
+                    if call in seen:
+                        continue
+                    seen.add(call)
+                    label = call
+                    grid = qso.get('GRIDSQUARE', '')
+                    if grid:
+                        label = f"{call} {grid[:4]}"
+                    ax.text(
+                        lon, lat, label,
+                        transform=proj,
+                        fontsize=3.5, color=color, alpha=0.95,
+                        va='bottom', ha='left',
+                        fontfamily='monospace',
+                        bbox=dict(facecolor=_MAP_BG, alpha=0.35,
+                                  pad=0.3, edgecolor='none'),
+                        zorder=7,
+                    )
+
+    # ---- Home station marker ---------------------------------------------
+    if home_pos:
+        home_lat, home_lon = home_pos
+        ax.plot(home_lon, home_lat, transform=proj,
+                marker='*', color='#FFFF00', markersize=14,
+                markeredgecolor='#FF8800', markeredgewidth=0.8,
+                zorder=10, label='Home')
+
+    # ---- Band legend ------------------------------------------------------
+    legend_patches = [
+        mpatches.Patch(color=BAND_COLORS.get(b, UNKNOWN_COLOR), label=b)
+        for b in sorted_bands
+    ]
+    if legend_patches:
+        ncols = max(1, len(legend_patches) // 8)
+        leg = ax.legend(
+            handles=legend_patches,
+            loc='lower left', fontsize=7,
+            framealpha=0.65, facecolor=_MAP_BG,
+            edgecolor='#334455', labelcolor='white',
+            ncol=ncols, borderpad=0.5,
+        )
+        leg.set_zorder(20)
+
+    # ---- Stats title ------------------------------------------------------
+    total = len(qsos_with_pos)
+    unique_cs = len({qso.get('CALL', '') for qso, _ in qsos_with_pos})
+    countries = len({qso.get('COUNTRY', '') for qso, _ in qsos_with_pos if qso.get('COUNTRY')})
+    title = f"{total:,} QSOs  ·  {unique_cs:,} unique callsigns  ·  {countries} countries"
+    fig.text(0.5, 0.975, title, ha='center', va='top',
+             color='white', fontsize=9, alpha=0.9)
+    fig.text(0.5, 0.005, 'generated by hamap', ha='center', va='bottom',
+             color='#336633', fontsize=6, alpha=0.7)
+
+    return fig
+
+
+# --------------------------------------------------------------------------- #
+# Argument parsing
+# --------------------------------------------------------------------------- #
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        prog='hamap',
+        description='Generate a high-resolution world map from an ADIF ham radio log.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  hamap contacts.adif\n"
+            "  hamap contacts.adif --output map.png\n"
+            "  hamap contacts.adif --preview\n"
+            "  hamap contacts.adif --my-grid EN82\n"
+            "  hamap --setup\n"
+        ),
+    )
+    p.add_argument('adif_file', metavar='FILE', nargs='?',
+                   help='ADIF log file to map')
+    p.add_argument('--output', '-o', metavar='FILE',
+                   help='Output PNG file (default: <input>.png)')
+    p.add_argument('--preview', action='store_true',
+                   help='Open the map in a window instead of saving')
+    p.add_argument('--my-grid', metavar='GRID',
+                   help='Home station Maidenhead grid square (e.g. EN82)')
+    p.add_argument('--no-lines', action='store_true',
+                   help='Skip great-circle lines to contacts')
+    p.add_argument('--no-labels', action='store_true',
+                   help='Skip callsign labels on the map')
+    p.add_argument('--dpi', type=int, default=300,
+                   help='Output resolution in DPI (default: 300)')
+    p.add_argument('--width', type=float, default=24.0,
+                   help='Figure width in inches (default: 24)')
+    p.add_argument('--height', type=float, default=12.0,
+                   help='Figure height in inches (default: 12)')
+    p.add_argument('--setup', action='store_true',
+                   help='Download offline map data to ~/.hamap/ and exit')
+
+    verbosity = p.add_mutually_exclusive_group()
+    verbosity.add_argument('--verbose', action='store_true',
+                           help='Show processing details')
+    verbosity.add_argument('--debug', action='store_true',
+                           help='Show debug output')
+    verbosity.add_argument('--trace', action='store_true',
+                           help='Show full trace output')
+    p.add_argument('--logfile', metavar='FILE',
+                   help='Also write log output to FILE')
+    p.add_argument('--syslog', action='store_true',
+                   help='Also send log output to syslog')
+
+    return p.parse_args()
+
+
+# --------------------------------------------------------------------------- #
+# Entry point
+# --------------------------------------------------------------------------- #
+
+def main():
+    args = parse_args()
+    log = AppLogger.from_args(args, 'hamap')
+
+    if args.setup:
+        do_setup(log)
+        return
+
+    if not args.adif_file:
+        log.error("No ADIF file specified. Use --help for usage.")
+        sys.exit(1)
+
+    # ---- Parse ADIF -------------------------------------------------------
+    header, records = parse_adif(args.adif_file, log)
+    log.info("Loaded %d QSO records from %s", len(records), args.adif_file)
+
+    # ---- Determine home station location ----------------------------------
+    home_pos = None
+    if args.my_grid:
+        home_pos = maidenhead_to_latlon(args.my_grid)
+        if home_pos:
+            log.verbose("Home: --my-grid %s → %.4f, %.4f", args.my_grid, *home_pos)
+        else:
+            log.warning("Could not parse home grid square: %s", args.my_grid)
+    else:
+        my_grid = header.get('MY_GRIDSQUARE', '')
+        if not my_grid:
+            for rec in records[:10]:
+                my_grid = rec.get('MY_GRIDSQUARE', '')
+                if my_grid:
+                    break
+        if my_grid:
+            home_pos = maidenhead_to_latlon(my_grid)
+            if home_pos:
+                log.verbose("Home: ADIF MY_GRIDSQUARE %s → %.4f, %.4f",
+                            my_grid, *home_pos)
+
+    if not home_pos:
+        log.info("Home station location unknown — great-circle lines disabled.")
+        log.info("  Provide one with --my-grid GRID (e.g. --my-grid EN82).")
+
+    # ---- Resolve contact locations ----------------------------------------
+    qsos_with_pos = []
+    skipped = 0
+    for qso in records:
+        pos = resolve_location(qso, log)
+        if pos:
+            qsos_with_pos.append((qso, pos))
+        else:
+            skipped += 1
+            log.debug("Skipped %s — no location data", qso.get('CALL', '?'))
+
+    log.info("Located %d of %d QSOs (%d skipped — no grid/country data)",
+             len(qsos_with_pos), len(records), skipped)
+
+    if not qsos_with_pos:
+        log.error("No QSOs with resolvable locations — cannot generate map.")
+        log.error("Ensure your ADIF file contains GRIDSQUARE or COUNTRY fields.")
+        sys.exit(1)
+
+    # ---- Determine output path --------------------------------------------
+    if args.output:
+        out_path = args.output
+    else:
+        out_path = os.path.splitext(os.path.abspath(args.adif_file))[0] + '.png'
+
+    # ---- Generate ---------------------------------------------------------
+    log.info("Generating map (%.0f×%.0f in @ %d DPI = ~%.0f×%.0f px)...",
+             args.width, args.height, args.dpi,
+             args.width * args.dpi, args.height * args.dpi)
+
+    fig = generate_map(qsos_with_pos, home_pos, args, log)
+
+    if args.preview:
+        log.info("Opening preview window...")
+        plt.show()
+    else:
+        log.info("Saving to %s...", out_path)
+        fig.savefig(out_path, dpi=args.dpi, bbox_inches='tight',
+                    facecolor=fig.get_facecolor())
+        log.info("Saved: %s", out_path)
+
+    plt.close(fig)
+
+
+if __name__ == '__main__':
+    main()
