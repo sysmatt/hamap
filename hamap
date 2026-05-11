@@ -1428,8 +1428,11 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  hamap contacts.adif\n"
+            "  hamap contacts.adif                      # save PNG (default)\n"
+            "  hamap contacts.adif --image              # explicit image mode\n"
+            "  hamap contacts.adif --html               # interactive Plotly HTML\n"
             "  hamap contacts.adif --output map.png\n"
+            "  hamap contacts.adif --html --output map.html\n"
             "  hamap contacts.adif --preview\n"
             "  hamap contacts.adif --my-grid EN82\n"
             "  hamap contacts.adif --start 2025-01-01 --end 2025-03-31\n"
@@ -1441,9 +1444,16 @@ def parse_args():
     p.add_argument('adif_file', metavar='FILE', nargs='?',
                    help='ADIF log file to map')
     p.add_argument('--output', '-o', metavar='FILE',
-                   help='Output PNG file (default: <input>.png)')
+                   help='Output file (default: <input>.png or <input>.html)')
+
+    out_mode = p.add_mutually_exclusive_group()
+    out_mode.add_argument('--image', action='store_true',
+                          help='Generate a PNG image (default)')
+    out_mode.add_argument('--html', action='store_true',
+                          help='Generate a self-contained interactive HTML map (Plotly)')
+
     p.add_argument('--preview', action='store_true',
-                   help='Open the map in a window instead of saving')
+                   help='Open the image in a window instead of saving (image mode only)')
     p.add_argument('--my-grid', metavar='GRID',
                    help='Home station Maidenhead grid square (e.g. EN82)')
     p.add_argument('--no-lines', action='store_true',
@@ -1466,8 +1476,6 @@ def parse_args():
                    help='Draw country name labels at centroid positions')
     p.add_argument('--label-states', action='store_true',
                    help='Draw US state / Canadian province labels at centroid positions')
-    p.add_argument('--html', action='store_true',
-                   help='Also write an HTML file with interactive contact popups')
 
     filt = p.add_argument_group('filtering')
     filt.add_argument('--start', metavar='DATE', type=_parse_date_arg,
@@ -1565,33 +1573,39 @@ def main():
         log.error("Ensure your ADIF file contains GRIDSQUARE or COUNTRY fields.")
         sys.exit(1)
 
-    # ---- Determine output path --------------------------------------------
-    if args.output:
-        out_path = args.output
-    else:
-        out_path = os.path.splitext(os.path.abspath(args.adif_file))[0] + '.png'
-
-    # ---- Generate ---------------------------------------------------------
-    log.info("Generating map (%.0f×%.0f in @ %d DPI = ~%.0f×%.0f px)...",
-             args.width, args.height, args.dpi,
-             args.width * args.dpi, args.height * args.dpi)
-
-    fig, groups = generate_map(qsos_with_pos, home_pos, args, log)
-
-    if args.preview:
-        log.info("Opening preview window...")
-        plt.show()
-    else:
-        log.info("Saving to %s...", out_path)
-        fig.savefig(out_path, dpi=args.dpi, bbox_inches='tight',
-                    facecolor=fig.get_facecolor())
-        log.info("Saved: %s", out_path)
-
+    # ---- Determine output mode and path -----------------------------------
     if args.html:
-        html_path = os.path.splitext(out_path)[0] + '.html'
-        generate_html_plotly(groups, args, home_pos, html_path, log)
+        ext      = '.html'
+        out_path = args.output or (
+            os.path.splitext(os.path.abspath(args.adif_file))[0] + ext)
 
-    plt.close(fig)
+        log.info("Generating interactive HTML map...")
+        groups = group_by_grid(qsos_with_pos, truncate=args.truncate_grids)
+        log.verbose("  %d unique grid/location groups from %d QSOs",
+                    len(groups), len(qsos_with_pos))
+        generate_html_plotly(groups, args, home_pos, out_path, log)
+
+    else:
+        # Image mode (default, or explicit --image)
+        out_path = args.output or (
+            os.path.splitext(os.path.abspath(args.adif_file))[0] + '.png')
+
+        log.info("Generating map (%.0f×%.0f in @ %d DPI = ~%.0f×%.0f px)...",
+                 args.width, args.height, args.dpi,
+                 args.width * args.dpi, args.height * args.dpi)
+
+        fig, _ = generate_map(qsos_with_pos, home_pos, args, log)
+
+        if args.preview:
+            log.info("Opening preview window...")
+            plt.show()
+        else:
+            log.info("Saving to %s...", out_path)
+            fig.savefig(out_path, dpi=args.dpi, bbox_inches='tight',
+                        facecolor=fig.get_facecolor())
+            log.info("Saved: %s", out_path)
+
+        plt.close(fig)
 
 
 if __name__ == '__main__':

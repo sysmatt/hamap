@@ -38,9 +38,13 @@ hamap [FILE] [OPTIONS]
 Positional:
   FILE                  ADIF log file to map
 
+Output mode (mutually exclusive, default is image):
+  --image               Generate a PNG image (default)
+  --html                Generate a self-contained interactive HTML map (Plotly)
+
 Options:
-  --output FILE, -o     Output PNG path (default: <input>.png)
-  --preview             Open map in a window instead of saving
+  --output FILE, -o     Output file path (default: <input>.png or <input>.html)
+  --preview             Open image in a window instead of saving (image mode only)
   --my-grid GRID        Home station Maidenhead grid square (e.g. EN82)
   --no-lines            Skip great-circle lines
   --no-labels           Skip callsign labels
@@ -51,7 +55,6 @@ Options:
   --truncate-grids      Reduce grid squares to 4-char accuracy before grouping
   --label-countries     Draw country name labels at their geographic centroids
   --label-states        Draw US state / Canadian province labels at their centroids
-  --html                Also write a self-contained interactive HTML map (Plotly)
   --setup               Download offline map data to ~/.hamap/ and exit
 
 Filtering (applied before rendering, in this order):
