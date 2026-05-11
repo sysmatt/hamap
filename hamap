@@ -1215,7 +1215,6 @@ def generate_html_plotly(groups, args, home_pos, out_path, log):
     # ── Contact dots, one trace per band (drives the legend) ─────────────────
     by_band_dots = defaultdict(lambda: {'lats': [], 'lons': [], 'hovers': []})
     for info in groups.values():
-        calls = sorted({qso.get('CALL', '') for qso in info['qsos']})
         band_counts = Counter(qso.get('BAND', '?').lower() for qso in info['qsos'])
         top_band    = band_counts.most_common(1)[0][0]
 
@@ -1234,7 +1233,7 @@ def generate_html_plotly(groups, args, home_pos, out_path, log):
         n_qso = len(info['qsos'])
         hover = (
             f"<b style='color:{info['color']}'>{info['label_header']}</b>"
-            f"  <span style='color:#8899aa'>"
+            f"&nbsp;&nbsp;<span style='color:#8899aa'>"
             f"{n_qso} QSO{'s' if n_qso != 1 else ''}</span><br>"
         )
         if bands_str:
@@ -1243,7 +1242,37 @@ def generate_html_plotly(groups, args, home_pos, out_path, log):
             hover += f"<span style='color:#8899aa'>{date_str}</span><br>"
         if countries:
             hover += f"<span style='color:#8899aa'>{', '.join(countries[:3])}</span><br>"
-        hover += '<br>'.join(calls)
+
+        detail_rows = []
+        for qso in sorted(info['qsos'],
+                          key=lambda q: (q.get('CALL', ''),
+                                         q.get('QSO_DATE', ''),
+                                         q.get('TIME_ON', ''))):
+            call  = qso.get('CALL', '')
+            name  = qso.get('NAME', '').strip()
+            t_raw = qso.get('TIME_ON', '')
+            t_fmt = (f"{t_raw[:2]}:{t_raw[2:4]}Z"
+                     if t_raw and len(t_raw) >= 4 else '')
+            d_fmt = _fmt_date(qso.get('QSO_DATE', ''))
+            city  = (qso.get('QTH', '') or qso.get('CITY', '')).strip()
+            band  = qso.get('BAND', '').lower()
+
+            meta = [x for x in [d_fmt, t_fmt, city, band] if x]
+            row  = f"<b style='color:#dce8f4'>{call}</b>"
+            if name:
+                row += f"&nbsp;<span style='color:#aabbd0'>{name}</span>"
+            if meta:
+                row += (f"<br>&nbsp;&nbsp;<span style='color:#607890'>"
+                        f"{' · '.join(meta)}</span>")
+            detail_rows.append(row)
+
+        overflow = len(detail_rows) - 25
+        if overflow > 0:
+            detail_rows = detail_rows[:25]
+            detail_rows.append(
+                f"<span style='color:#8899aa'>… and {overflow} more</span>")
+
+        hover += '<br>'.join(detail_rows)
 
         by_band_dots[top_band]['lats'].append(info['dot_lat'])
         by_band_dots[top_band]['lons'].append(info['dot_lon'])
@@ -1256,7 +1285,7 @@ def generate_html_plotly(groups, args, home_pos, out_path, log):
         dot_traces.append(go.Scattergeo(
             lat=d['lats'], lon=d['lons'],
             mode='markers',
-            marker=dict(size=6, color=color, opacity=0.9,
+            marker=dict(size=12, color=color, opacity=0.9,
                         line=dict(width=0.5, color=color)),
             customdata=d['hovers'],
             hovertemplate='%{customdata}<extra></extra>',
@@ -1352,8 +1381,8 @@ def generate_html_plotly(groups, args, home_pos, out_path, log):
             x=1, y=0, xanchor='right', yanchor='bottom',
             bgcolor='rgba(13,27,42,0.85)',
             bordercolor='#334455', borderwidth=1,
-            font=dict(color='white', size=10, family='monospace'),
-            title=dict(text='Band', font=dict(color='#8899aa', size=10)),
+            font=dict(color='white', size=20, family='monospace'),
+            title=dict(text='Band', font=dict(color='#8899aa', size=20)),
         ),
         hoverlabel=dict(
             bgcolor='#0d1b2a', bordercolor='#3a5a7a', align='left',
@@ -1365,17 +1394,103 @@ def generate_html_plotly(groups, args, home_pos, out_path, log):
             xref='paper', yref='paper',
             x=0.01, y=0.02, xanchor='left', yanchor='bottom',
             showarrow=False,
-            font=dict(family='monospace', size=10, color='#c8d8e8'),
+            font=dict(family='monospace', size=20, color='#c8d8e8'),
             bgcolor='rgba(13,27,42,0.85)',
             bordercolor='#3a5a7a', borderwidth=1, borderpad=6,
         )],
     )
+
+    _click_js = """\
+(function () {
+    function attachClickHandler() {
+        var gd = document.querySelector('.js-plotly-plot');
+        if (!gd) { setTimeout(attachClickHandler, 100); return; }
+        var pinned = {};
+        var zTop = 9999;
+        gd.style.position = 'relative';
+        gd.on('plotly_click', function (data) {
+            if (!data || !data.points || !data.points.length) return;
+            var pt = data.points[0];
+            if (!pt.customdata) return;
+            var key = pt.curveNumber + '_' + pt.pointNumber;
+            if (pinned[key]) { pinned[key].remove(); delete pinned[key]; return; }
+            var evt = data.event;
+            var rect = gd.getBoundingClientRect();
+            var x = evt.clientX - rect.left;
+            var y = evt.clientY - rect.top;
+
+            var popup = document.createElement('div');
+            popup.style.cssText = 'position:absolute;left:' + (x + 14) + 'px;top:' + (y - 14) + 'px;'
+                + 'background:#0d1b2a;border:1px solid #3a5a7a;border-radius:5px;'
+                + 'font-family:monospace;font-size:14px;color:#c8d8e8;max-width:380px;'
+                + 'box-shadow:0 3px 12px rgba(0,0,0,0.7);line-height:1.5;'
+                + 'pointer-events:auto;overflow:hidden;z-index:' + (++zTop) + ';';
+            popup.onclick = function (e) { e.stopPropagation(); };
+
+            // Title bar: drag grip (left) + dismiss button (right)
+            var bar = document.createElement('div');
+            bar.style.cssText = 'display:flex;align-items:center;justify-content:space-between;'
+                + 'background:#1a3a5a;border-bottom:1px solid #2a5070;'
+                + 'border-radius:4px 4px 0 0;padding:3px 6px;cursor:move;';
+
+            var grip = document.createElement('span');
+            grip.style.cssText = 'color:#4a7a9a;font-size:11px;letter-spacing:3px;'
+                + 'user-select:none;pointer-events:none;';
+            grip.innerHTML = '&#8942;&#8942;&#8942;';
+
+            var btn = document.createElement('button');
+            btn.innerHTML = '&times;';
+            btn.title = 'Dismiss';
+            btn.style.cssText = 'background:none;border:none;color:#8899aa;cursor:pointer;'
+                + 'font-size:16px;padding:0 2px;line-height:1;';
+            btn.onclick = (function (k, p) {
+                return function (e) { e.stopPropagation(); p.remove(); delete pinned[k]; };
+            }(key, popup));
+
+            bar.appendChild(grip);
+            bar.appendChild(btn);
+
+            var body = document.createElement('div');
+            body.style.cssText = 'padding:8px 12px 10px 12px;';
+            body.innerHTML = pt.customdata;
+
+            popup.appendChild(bar);
+            popup.appendChild(body);
+            gd.appendChild(popup);
+            pinned[key] = popup;
+
+            // Drag: mousedown on bar (not on the close button) starts a drag
+            bar.addEventListener('mousedown', function (e) {
+                if (e.target === btn) return;
+                e.preventDefault();
+                e.stopPropagation();
+                popup.style.zIndex = ++zTop;
+                var sx = e.clientX, sy = e.clientY;
+                var sl = parseInt(popup.style.left) || 0;
+                var st = parseInt(popup.style.top)  || 0;
+                function onMove(e) {
+                    popup.style.left = (sl + e.clientX - sx) + 'px';
+                    popup.style.top  = (st + e.clientY - sy) + 'px';
+                }
+                function onUp() {
+                    document.removeEventListener('mousemove', onMove);
+                    document.removeEventListener('mouseup',   onUp);
+                }
+                document.addEventListener('mousemove', onMove);
+                document.addEventListener('mouseup',   onUp);
+            });
+        });
+    }
+    attachClickHandler();
+}());
+"""
 
     fig.write_html(
         out_path,
         include_plotlyjs=True,
         config=dict(scrollZoom=True,
                     modeBarButtonsToRemove=['select2d', 'lasso2d']),
+        post_script=_click_js,
     )
     log.info("HTML saved: %s", out_path)
 
