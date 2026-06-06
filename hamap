@@ -9,6 +9,7 @@ import math
 import os
 import re
 import sys
+import unicodedata
 import warnings
 from collections import Counter, defaultdict
 
@@ -196,6 +197,53 @@ BAND_COLORS = {
     '23cm': '#CCCCCC',
 }
 UNKNOWN_COLOR = '#FFFF44'
+
+# Remapping from ADIF COUNTRY values to Natural Earth names, kept only for
+# cases where normalization + fuzzy matching cannot bridge the gap on their own.
+_DXCC_TO_MAPUNIT = {
+    # Wholly different names
+    'United States':         'United States of America',
+    'European Russia':       'Russia',
+    'Asiatic Russia':        'Russia',
+    'Asiatic Turkey':        'Turkey',
+    'European Turkey':       'Turkey',
+    'North Korea':           'Dem. Rep. Korea',
+    'South Korea':           'Republic of Korea',
+    'Laos':                  'Lao PDR',
+    'East Timor':            'Timor-Leste',
+    'Hong Kong':             'Hong Kong S.A.R.',
+    'Macau':                 'Macao S.A.R',
+    'North Macedonia':       'Macedonia',
+    'South Sudan':           'S. Sudan',
+    'Vatican City':          'Vatican',
+    'Ivory Coast':           "Côte d'Ivoire",
+    'Cape Verde':            'Cabo Verde',
+    'Western Sahara':        'W. Sahara',
+    # ADIF singular vs NE plural/compound (norm expansion covers many, not these)
+    'Madeira Island':        'Madeira',
+    'Reunion Island':        'Reunion',
+    'Ascension Island':      'Ascension',
+    # 'Sint' ≠ 'Saint' — expansion can't bridge this
+    'St. Maarten':           'Sint Maarten',
+    # Short ADIF name vs NE full compound name — fuzzy ratio too low
+    'St Vincent':            'Saint Vincent and the Grenadines',
+    'St. Vincent':           'Saint Vincent and the Grenadines',
+    'US Virgin Islands':     'United States Virgin Islands',
+    # Multi-entity DXCC mapped to best single NE polygon
+    'Dodecanese':            'Greece',
+    'Ceuta and Melilla':     'Ceuta',
+    # admin_1 records with empty name_en — must map to native-language name field
+    'Sardinia':              'Sardegna',        # Italian admin_1 name
+    'Canary Islands':        'Islas Canarias',  # Spanish admin_1 name
+}
+
+
+def _dxcc_ncols(n_calls):
+    """Number of columns for condensed callsign layout in DXCC box."""
+    if n_calls <= 6:  return 1
+    if n_calls <= 16: return 2
+    return 3
+
 
 _BAND_ORDER = ['160m', '80m', '60m', '40m', '30m', '20m', '17m', '15m',
                '12m', '10m', '6m', '4m', '2m', '70cm', '23cm']
@@ -635,6 +683,7 @@ def do_setup(log):
         ('physical',  'ocean',             '110m'),
         ('physical',  'coastline',         '110m'),
         ('cultural',  'admin_0_countries', '110m'),
+        ('cultural',  'admin_0_map_units',  '10m'),
     ]
 
     ok = 0
@@ -721,6 +770,158 @@ def group_by_grid(qsos_with_pos, truncate=False):
     return groups
 
 
+def group_by_dxcc(qsos_with_pos, log):
+    """
+    Group QSOs by DXCC entity (DXCC field, falling back to COUNTRY name).
+    One group per entity; dot positioned at the entity centroid.
+
+    Returns the same dict shape as group_by_grid().
+    """
+    groups = {}
+    for qso, (lat, lon) in qsos_with_pos:
+        dxcc_num = qso.get('DXCC', '').strip()
+        country  = qso.get('COUNTRY', '').strip()
+        key      = dxcc_num if dxcc_num else (f'_CTY_{country}' if country else
+                                              f'_POS_{lat:.0f}_{lon:.0f}')
+        if key not in groups:
+            centroid = _country_centroid(country)
+            groups[key] = {
+                'dot_lat':      centroid[0] if centroid else lat,
+                'dot_lon':      centroid[1] if centroid else lon,
+                'qsos':         [],
+                'label_header': (country[:16] if country else dxcc_num or '?'),
+                'country':      country,
+                'dxcc_num':     dxcc_num,
+            }
+        groups[key]['qsos'].append(qso)
+
+    for info in groups.values():
+        band_counts = Counter(qso.get('BAND', 'unknown').lower()
+                              for qso in info['qsos'])
+        top_band = band_counts.most_common(1)[0][0]
+        info['color'] = BAND_COLORS.get(top_band, UNKNOWN_COLOR)
+
+    log.verbose("DXCC mode: %d entities from %d QSOs", len(groups), len(qsos_with_pos))
+    return groups
+
+
+_NE_ABBREVS = {'st': 'saint', 'ste': 'sainte', 'is': 'islands', 'isl': 'islands'}
+
+
+def _ne_norm(s):
+    """
+    Normalise a place name for fuzzy comparison:
+      - strip Unicode accents
+      - fold '&' → 'and'
+      - remove remaining punctuation
+      - expand common geographic abbreviations (St.→saint, Is.→islands)
+      - lowercase, collapse whitespace
+    """
+    s = unicodedata.normalize('NFD', s)
+    s = ''.join(c for c in s if unicodedata.category(c) != 'Mn')
+    s = re.sub(r'\s*&\s*', ' and ', s.lower())
+    s = re.sub(r'[^\w\s]', ' ', s)
+    words = [_NE_ABBREVS.get(w, w) for w in s.split()]
+    return ' '.join(words)
+
+
+def load_dxcc_geometries(groups, log):
+    """
+    Return {country_name: shapely_geometry} for each entity in *groups*.
+
+    Matching pipeline (first hit wins):
+      1. Explicit remap via _DXCC_TO_MAPUNIT
+      2. Exact case-insensitive lookup in admin_0_map_units 10m (sovereign +
+         overseas territories — covers small islands absent from 110m)
+      3. Normalised lookup (strips accents, expands St./Is. abbreviations,
+         folds &→and) — catches Cayman Is.↔Islands, Côte d'Ivoire, etc.
+      4. Same two passes against admin_1_states_provinces 10m — catches
+         sub-national DXCC entities (Alaska, Hawaii, Sardinia, Crete, …)
+      5. difflib fuzzy match (cutoff 0.80) on the normalised admin_0 names
+         — catches Faroe↔Faeroe, slight spelling variants
+
+    Unmatched entities get no fill polygon; their label box is still drawn.
+    """
+    import cartopy.io.shapereader as shpreader
+    import difflib
+
+    ne_exact = {}   # lower(name) → geometry
+    ne_norm  = {}   # _ne_norm(name) → geometry
+
+    def _add(val, geom):
+        val = (val or '').strip()
+        if not val:
+            return
+        ne_exact.setdefault(val.lower(), geom)
+        ne_norm.setdefault(_ne_norm(val), geom)
+
+    # ── Primary: admin_0_map_units at 10m ────────────────────────────────────
+    # At 10m, small territories (Guernsey, Isle of Man, Anguilla, …) are present
+    # as separate polygons that are absent from the coarser 110m file.
+    log.verbose("DXCC fill: loading admin_0_map_units (10m)...")
+    shp0 = shpreader.natural_earth(
+        resolution='10m', category='cultural', name='admin_0_map_units')
+    for rec in shpreader.Reader(shp0).records():
+        a = rec.attributes
+        for f in ('NAME', 'NAME_LONG', 'SOVEREIGNT', 'ADMIN',
+                  'GEOUNIT', 'SUBUNIT', 'FORMAL_EN', 'NAME_CIAWF',
+                  'BRK_NAME', 'NAME_ALT'):
+            _add(a.get(f, ''), rec.geometry)
+
+    # Snapshot the admin_0 normalised keys for fuzzy pass (step 5)
+    ne_norm_keys_a0 = list(ne_norm.keys())
+
+    # ── Secondary: admin_1_states_provinces at 10m ───────────────────────────
+    # Needed for sub-national DXCC entities: Alaska, Hawaii, Sardinia (Sardegna
+    # / name_en=Sardinia), Crete (Kriti / name_en=Crete), Balearic Islands, …
+    log.verbose("DXCC fill: loading admin_1_states_provinces (10m)...")
+    shp1 = shpreader.natural_earth(
+        resolution='10m', category='cultural', name='admin_1_states_provinces')
+    for rec in shpreader.Reader(shp1).records():
+        a = rec.attributes
+        for f in ('name', 'name_en', 'name_alt', 'gn_name', 'woe_name'):
+            _add(a.get(f, ''), rec.geometry)
+
+    geometries = {}
+    for info in groups.values():
+        country = info.get('country', '')
+        if not country:
+            continue
+
+        # Step 1: explicit remap
+        target = _DXCC_TO_MAPUNIT.get(country, country)
+
+        # Step 2: exact (case-insensitive)
+        geom = ne_exact.get(target.lower())
+
+        # Step 3: normalised
+        if not geom:
+            geom = ne_norm.get(_ne_norm(target))
+
+        # Step 4: try original ADIF name through exact + norm (in case remapping
+        # pointed at a wrong target but the original name actually matches)
+        if not geom and target != country:
+            geom = ne_exact.get(country.lower()) or ne_norm.get(_ne_norm(country))
+
+        # Step 5: fuzzy against admin_0 normalised names only
+        if not geom:
+            q = _ne_norm(target)
+            hits = difflib.get_close_matches(q, ne_norm_keys_a0, n=1, cutoff=0.80)
+            if hits:
+                geom = ne_norm[hits[0]]
+                log.debug("DXCC fill: fuzzy-matched %r → %r", country, hits[0])
+
+        if geom:
+            geometries[country] = geom
+        else:
+            log.debug("DXCC fill: no shapefile match for %r (tried %r)",
+                      country, target)
+
+    log.verbose("DXCC fill: matched %d of %d entities to polygons",
+                len(geometries), sum(1 for i in groups.values() if i.get('country')))
+    return geometries
+
+
 # --------------------------------------------------------------------------- #
 # Label placement  (pixel-coordinate greedy placer)
 # --------------------------------------------------------------------------- #
@@ -754,12 +955,15 @@ _PLACE_ANGLES = [90, 60, 120, 30, 150, 0, 180, -30, -150,
                  -15, -165, -45, -135, -75, -105]
 
 
-def place_labels(groups, args, log, ax, pre_placed=None):
+def place_labels(groups, args, log, ax, pre_placed=None, land_prep=None):
     """
     Two-pass greedy label placer working entirely in display (pixel) coordinates.
 
     pre_placed: optional list of [cx, cy, hw, hh, key] obstacles already on the
                 map (e.g. country/state text labels) that callsign boxes must avoid.
+    land_prep:  optional shapely PreparedGeometry of the world land polygons.
+                When provided (DXCC mode), the placer tries ocean positions first
+                before falling back to any collision-free position.
 
     Returns (positions, boxes_px) where:
         positions = {key: (label_lat, label_lon)}   — box centres in data coords
@@ -781,10 +985,19 @@ def place_labels(groups, args, log, ax, pre_placed=None):
         leading = char_h * 1.2
         pad     = char_h * 0.2
         calls   = _calls(info)
-        max_ch  = max(len(l) for l in [info['label_header']] + (calls or ['']))
-        # top pad + header + small sep zone + N call lines + bottom pad
-        h_px    = pad + char_h + pad * 0.5 + 1.0 + len(calls) * leading + pad
-        return max_ch * char_w + 2 * pad, h_px
+        # top pad + header + small sep zone + call lines + bottom pad
+        if getattr(args, 'dxcc', False) and calls:
+            ncols  = info.get('dxcc_ncols', _dxcc_ncols(len(calls)))
+            nrows  = math.ceil(len(calls) / ncols)
+            max_cw = max(len(c) for c in calls)
+            hdr_w  = len(info['label_header']) * char_w + 2 * pad
+            w_px   = max(hdr_w, ncols * (max_cw * char_w + pad) + pad)
+            h_px   = pad + char_h + pad * 0.5 + 1.0 + nrows * leading + pad
+        else:
+            max_ch = max(len(l) for l in [info['label_header']] + (calls or ['']))
+            h_px   = pad + char_h + pad * 0.5 + 1.0 + len(calls) * leading + pad
+            w_px   = max_ch * char_w + 2 * pad
+        return w_px, h_px
 
     dot_r_px = math.sqrt(10.0 / math.pi) * (dpi / 72.0) + 2.0
     gap_px   = max(4.0, font_pt * dpi / 72.0 * 0.6)
@@ -823,17 +1036,31 @@ def place_labels(groups, args, log, ax, pre_placed=None):
         hw, hh     = w_px / 2.0, h_px / 2.0
         r0         = dot_r_px + math.hypot(hw, hh) + gap_px
 
-        for mult in [1.0, 1.35, 1.75, 2.3, 3.1, 4.2, 5.8, 8.0, 11.0, 16.0, 24.0]:
-            r = r0 * mult
-            for ang_deg in _PLACE_ANGLES:
-                ang = math.radians(ang_deg)
-                cx  = dx + r * math.cos(ang)
-                cy  = dy + r * math.sin(ang)
-                if not _in_bounds(cx, cy, hw, hh):
-                    continue
-                if not _collides(cx, cy, hw, hh, skip_key=skip_key):
+        def _sweep(ocean_only=False):
+            for mult in [1.0, 1.35, 1.75, 2.3, 3.1, 4.2, 5.8, 8.0, 11.0, 16.0, 24.0]:
+                r = r0 * mult
+                for ang_deg in _PLACE_ANGLES:
+                    ang = math.radians(ang_deg)
+                    cx  = dx + r * math.cos(ang)
+                    cy  = dy + r * math.sin(ang)
+                    if not _in_bounds(cx, cy, hw, hh):
+                        continue
+                    if _collides(cx, cy, hw, hh, skip_key=skip_key):
+                        continue
+                    if ocean_only:
+                        from shapely.geometry import Point as _Pt
+                        plat, plon = px_to_ll(cx, cy)
+                        if land_prep.contains(_Pt(plon, plat)):
+                            continue   # on land — skip during ocean-first pass
                     return cx, cy, hw, hh
-        return None
+            return None
+
+        # In DXCC mode, prefer ocean positions; fall back to any valid spot.
+        if land_prep is not None:
+            result = _sweep(ocean_only=True)
+            if result:
+                return result
+        return _sweep(ocean_only=False)
 
     order = sorted(groups.keys(), key=lambda k: -len(groups[k]['qsos']))
 
@@ -923,14 +1150,54 @@ def generate_map(qsos_with_pos, home_pos, args, log):
     gl.xlocator = mticker.MultipleLocator(30)
     gl.ylocator = mticker.MultipleLocator(30)
 
-    # ---- Group contacts by grid square -----------------------------------
+    # ---- Group contacts by grid square / DXCC entity --------------------
     log.verbose("Grouping contacts...")
-    groups = group_by_grid(qsos_with_pos, truncate=args.truncate_grids)
-    log.verbose("  %d unique grid/location groups from %d QSOs",
-                len(groups), len(qsos_with_pos))
+    if getattr(args, 'dxcc', False):
+        groups = group_by_dxcc(qsos_with_pos, log)
+    else:
+        groups = group_by_grid(qsos_with_pos, truncate=args.truncate_grids)
+    log.verbose("  %d unique groups from %d QSOs", len(groups), len(qsos_with_pos))
+
+    # ll_to_px / px_to_ll needed for both DXCC column sizing and label obstacles
+    ll_to_px, px_to_ll, *_ = _ax_pixel_fns(ax, args)
+
+    # ---- DXCC entity flood fill (below dots/labels, above land) ----------
+    if getattr(args, 'dxcc', False):
+        dxcc_geometries = load_dxcc_geometries(groups, log)
+        _ch  = args.font_size * args.dpi / 72.0   # char height in px (for col sizing)
+        _cw  = _ch * 0.62                          # char width in px
+        for info in groups.values():
+            geom = dxcc_geometries.get(info.get('country', ''))
+            if geom:
+                ax.add_geometries(
+                    [geom], crs=ccrs.PlateCarree(),
+                    facecolor=info['color'], edgecolor=info['color'],
+                    linewidth=0.5, alpha=0.30, zorder=4,
+                )
+                # Compute ncols from entity pixel width so the box
+                # scales with the size of the entity on the map.
+                calls_ = sorted({q.get('CALL', '') for q in info['qsos']})
+                if calls_:
+                    max_cw_   = max(len(c) for c in calls_)
+                    col_w_px  = max_cw_ * _cw + _ch * 0.4   # width of one column
+                    minx, _, maxx, _ = geom.bounds
+                    px_l, _ = ll_to_px(max(minx, -179.9), 0)
+                    px_r, _ = ll_to_px(min(maxx,  179.9), 0)
+                    entity_w = max(0.0, px_r - px_l)
+                    # Fill ~50% of the entity width; cap at 10 cols, ensure ≥2 rows
+                    ncols = max(1, min(len(calls_), 10,
+                                      int(entity_w * 0.50 / col_w_px)))
+                    ncols = min(ncols, math.ceil(len(calls_) / 2))
+                    info['dxcc_ncols'] = max(1, ncols)
+                else:
+                    info['dxcc_ncols'] = 1
+        # Fallback for entities with no matched geometry
+        for info in groups.values():
+            if 'dxcc_ncols' not in info:
+                calls_ = sorted({q.get('CALL', '') for q in info['qsos']})
+                info['dxcc_ncols'] = _dxcc_ncols(len(calls_))
 
     # ---- Fixed text labels (countries / states) — drawn first, act as obstacles
-    ll_to_px, px_to_ll, *_ = _ax_pixel_fns(ax, args)
     pre_placed = []
 
     def _text_obs(name, lat, lon, fpt):
@@ -963,11 +1230,27 @@ def generate_map(qsos_with_pos, home_pos, args, log):
                     va='center', ha='center',
                     fontfamily='monospace', alpha=0.55, zorder=5)
 
+    # ---- Prepare land geometry for DXCC ocean-preference placement --------
+    _land_prep = None
+    if getattr(args, 'dxcc', False) and not args.no_labels:
+        try:
+            import cartopy.io.shapereader as shpreader
+            from shapely.ops import unary_union
+            from shapely.prepared import prep as _sprep
+            log.verbose("DXCC placement: preparing land mask for ocean preference...")
+            _land_shp   = shpreader.natural_earth(
+                resolution='110m', category='physical', name='land')
+            _land_union = unary_union(list(shpreader.Reader(_land_shp).geometries()))
+            _land_prep  = _sprep(_land_union)
+        except Exception as exc:
+            log.debug("Land geometry unavailable, ocean preference disabled: %s", exc)
+
     # ---- Compute label positions -----------------------------------------
     if not args.no_labels:
         log.verbose("Computing label positions...")
         label_pos, boxes_px = place_labels(groups, args, log, ax,
-                                           pre_placed=pre_placed)
+                                           pre_placed=pre_placed,
+                                           land_prep=_land_prep)
     else:
         label_pos, boxes_px = {}, {}
 
@@ -1057,13 +1340,32 @@ def generate_map(qsos_with_pos, home_pos, args, log):
 
             # Callsign text block
             if calls:
-                calls_center_y   = sep_y_px - pad_px * 0.25 - len(calls) * leading / 2
-                calls_lat, _     = px_to_ll(cx, calls_center_y)
-                ax.text(lbl_lon, calls_lat, '\n'.join(calls),
-                        transform=proj,
-                        fontsize=args.font_size, color=color,
-                        va='center', ha='center',
-                        fontfamily='monospace', zorder=9)
+                if getattr(args, 'dxcc', False):
+                    ncols       = info.get('dxcc_ncols', _dxcc_ncols(len(calls)))
+                    nrows       = math.ceil(len(calls) / ncols)
+                    max_cw      = max(len(c) for c in calls)
+                    col_w_px    = max_cw * char_h * 0.62 + pad_px
+                    center_y    = sep_y_px - pad_px * 0.25 - nrows * leading / 2
+                    anchor_lat, _ = px_to_ll(cx, center_y)
+                    for ci in range(ncols):
+                        col_calls = calls[ci * nrows:(ci + 1) * nrows]
+                        if not col_calls:
+                            continue
+                        col_x_px = cx - (ncols - 1) * col_w_px / 2 + ci * col_w_px
+                        _, col_lon = px_to_ll(col_x_px, center_y)
+                        ax.text(col_lon, anchor_lat, '\n'.join(col_calls),
+                                transform=proj,
+                                fontsize=args.font_size, color=color,
+                                va='center', ha='center',
+                                fontfamily='monospace', zorder=9)
+                else:
+                    calls_center_y = sep_y_px - pad_px * 0.25 - len(calls) * leading / 2
+                    calls_lat, _   = px_to_ll(cx, calls_center_y)
+                    ax.text(lbl_lon, calls_lat, '\n'.join(calls),
+                            transform=proj,
+                            fontsize=args.font_size, color=color,
+                            va='center', ha='center',
+                            fontfamily='monospace', zorder=9)
 
     # ---- Home station marker ---------------------------------------------
     if home_pos:
@@ -1616,6 +1918,8 @@ def parse_args():
                    help='Draw country name labels at centroid positions')
     p.add_argument('--label-states', action='store_true',
                    help='Draw US state / Canadian province labels at centroid positions')
+    p.add_argument('--dxcc', action='store_true',
+                   help='DXCC mode: flood-fill LoTW-confirmed entities, one box per entity')
 
     filt = p.add_argument_group('filtering')
     filt.add_argument('--start', metavar='DATE', type=_parse_date_arg,
@@ -1668,6 +1972,17 @@ def main():
     if not records:
         log.error("No QSOs remain after filtering.")
         sys.exit(1)
+
+    # ---- DXCC mode: keep only LoTW-confirmed QSOs ------------------------
+    if args.dxcc:
+        before  = len(records)
+        records = [r for r in records if r.get('LOTW_QSL_RCVD', '').upper() == 'Y']
+        log.info("--dxcc: %d → %d LoTW-confirmed QSOs", before, len(records))
+        if not records:
+            log.error("No LoTW-confirmed QSOs found (LOTW_QSL_RCVD=Y). "
+                      "Ensure your ADIF export includes LoTW confirmation fields.")
+            sys.exit(1)
+        args.no_lines = True
 
     # ---- Determine home station location ----------------------------------
     home_pos = None
