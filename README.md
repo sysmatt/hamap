@@ -53,14 +53,19 @@ Output mode (mutually exclusive, default is image):
   --image               Generate a PNG image (default)
   --html                Generate a self-contained interactive HTML map (Plotly)
 
+Profiles (see "Profiles" below):
+  --profile NAME        auto (default), small, big, or one from the config file
+  --config FILE         Profile config file (default: ~/.hamap/config.ini)
+  --show-config         Print effective settings and where each came from, then exit
+
 Options:
   --output FILE, -o     Output file path (default: <input>.png or <input>.html)
   --preview             Open image in a window instead of saving (image mode only)
   --my-grid GRID        Home station Maidenhead grid square (e.g. EN82)
-  --no-lines            Skip great-circle lines
-  --line-alpha A        Great-circle line opacity 0..1 (default: auto — 0.45 for
+  --no-lines / --lines  Skip / draw great-circle lines
+  --line-alpha A        Great-circle line opacity 0..1, or auto (default: 0.45 for
                         small logs, fading toward 0.12 as contacts grow)
-  --no-labels           Skip callsign labels (image mode)
+  --no-labels / --labels  Skip / draw callsign labels (image mode)
   --dpi N               Output DPI (default: 300)
   --width N             Figure width in inches (default: 48); height follows the extent
   --extent MODE         auto  = fit contacts + home, plus a margin (default)
@@ -71,14 +76,19 @@ Options:
                         entity = one box per US state / Canadian province,
                                  otherwise per country; one dot per region,
                                  region tinted in its dominant band colour
-  --box-calls N         Callsigns per box: omit for all; N = the N busiest plus
+  --color-by MODE       band   = colour by each group's most common band (default)
+                        region = neighbouring regions get distinct colours, so it's
+                                 obvious which dot, line and box belong together
+  --box-calls N         Callsigns per box: all (default); N = the N busiest plus
                         a "+k more" footer; 0 = summary (calls, grids, QSOs per band)
   --ocean-boxes         Prefer open water for info boxes when it isn't a big
                         detour, freeing land for inland boxes (experimental)
+                        [--no-ocean-boxes turns it off]
   --ocean-reach DEG     Max distance a box may move to reach open water (default: 8)
   --truncate-grids      Reduce grid squares to 4-char accuracy before grouping
   --label-countries     Draw country name labels at their geographic centroids
   --label-states        Draw US state / Canadian province labels and borders
+                        [each has a --no-... form to undo a profile setting]
   --dxcc                DXCC mode: shade LoTW-confirmed entities, one box per entity
   --setup               Download offline map data to ~/.hamap/ and exit
 
@@ -97,8 +107,14 @@ Verbosity:
 ### Examples
 
 ```bash
-# Save a PNG map alongside the ADIF file (default)
+# Save a PNG map alongside the ADIF file (default; profile auto picks small/big)
 hamap wsjtx_log.adi
+
+# Force a profile, overriding one of its settings
+hamap wsjtx_log.adi --profile big --box-calls 20
+
+# What settings will be used, and why?
+hamap wsjtx_log.adi --show-config
 
 # Interactive HTML map
 hamap wsjtx_log.adi --html
@@ -138,15 +154,53 @@ hamap wsjtx_log.adi --no-labels
 hamap wsjtx_log.adi --no-lines
 ```
 
+## Profiles
+
+A profile is a named set of option defaults. Settings are layered, each overriding the one before:
+
+**built-in defaults → profile (and any profile it extends) → command line**
+
+So `hamap log.adi --profile big --box-calls 20` uses everything from `big` except the box cap. Every on/off option has an "off" form (`--no-ocean-boxes`, `--lines`, …) so the command line can always undo a profile.
+
+| Profile | Settings |
+|---------|----------|
+| `auto` *(default)* | Picks `small` or `big` after reading the log: `big` at ≥ 300 distinct 4-character grids (counted after date/tail filters). |
+| `small` | The plain defaults: one box per grid, all callsigns, 48 in wide. |
+| `big` | `--truncate-grids --group-by entity --box-calls 12 --ocean-boxes --color-by region --label-countries --label-states --width 64` |
+
+Run `hamap log.adi --show-config` to see the effective settings, which profile `auto` picked, and where each value came from (`*` marks anything not at its built-in default).
+
+### Custom profiles
+
+Define your own in `~/.hamap/config.ini` (or `--config FILE`). Keys are long option names without the leading dashes; on/off options take `yes`/`no`:
+
+```ini
+[defaults]
+profile = poster            # used when --profile isn't given (instead of auto)
+
+[profile:poster]
+extends    = big            # start from big, then change:
+width      = 80
+extent     = full
+line-alpha = 0.1
+
+[profile:quick]
+dpi        = 150
+no-lines   = yes
+```
+
+A config profile with a built-in's name (`small`, `big`) replaces the built-in, and `auto` will use your version. Input/output options (`FILE`, `--output`), `--preview` and `--setup` can't be set in a profile.
+
 ## Large Logs
 
-hamap handles logs with thousands of QSOs, but box placement is ultimately limited by how many pixels each degree of map gets. Tips:
+hamap handles logs with thousands of QSOs, but box placement is ultimately limited by how many pixels each degree of map gets. The `big` profile (picked automatically for large logs) bundles the settings that work best; the individual levers are:
 
 - **`--truncate-grids`** groups contacts by 4-character grid, which usually cuts the number of boxes by about 40%.
-- **Go wider.** Canvas width is the biggest lever for placement quality. On a 1,600-QSO log, going from `--width 48` to `--width 64` halved the total leader-line length, and `--width 80` cut it by about 55%. The cost is memory: roughly 1.1 GB at 48 in, rising with the square of the width.
+- **Go wider.** Canvas width is the biggest lever for placement quality: box text stays the same pixel size, so the map gets more room around each box. On a 1,600-QSO log in entity mode, leader lines were about 30% shorter (in map distance) at 64 in than at 48 in, and about 47% shorter at 80 in. Costs grow with the square of the width — 48 in ≈ 95 MP / 1.2 GB RAM, 64 in ≈ 167 MP / 1.8 GB, 80 in ≈ 261 MP / 2.7 GB — and some viewers (phones, web galleries) downscale or refuse images much past ~200 MP. `big` uses 64.
 - **`--group-by entity`** consolidates by US state / Canadian province / country (e.g. 568 grid boxes → 184 entity boxes). Each region gets a single dot at the centroid of the area actually worked (so "Russia" anchors in European Russia when that's where the contacts are), one great-circle line, and one box; the region itself is tinted in its dominant band colour, which doubles as a worked-entities map. The state comes from the ADIF `STATE` field, falling back to the Natural Earth province shapes (with nearest-province matching for grid centres that land in lakes or offshore).
 - **`--box-calls N`** caps box size: `--box-calls 12` lists the 12 busiest callsigns plus "+k more"; `--box-calls 0` replaces the list with a summary (callsigns, grids, QSOs per band). Works in both grid and entity modes.
 - **`--ocean-boxes`** (experimental) moves crowded coastal boxes offshore so inland regions keep room near their dots. A box goes to sea only if its whole rectangle clears land and the open-water spot is no more than 2.5× as far as the nearest free spot of any kind, so boxes with room beside their dot stay put. It works best with `--group-by entity`; with grid boxes it tends to build a wall of boxes along coastlines.
+- **`--color-by region`** gives up band colouring so that colour only says "these belong together": each region's dot, great-circle line, leader, box and tint share one colour, and neighbours always differ. Neighbours are regions within about 1.5° of each other *and* regions whose boxes or dots end up close on the page (ocean-placed boxes can sit side by side although their regions don't touch). Colouring is palette-aware: 8 colours checked for contrast on both the ocean and the land, and pairs that look alike (including under red-green colour blindness) are kept off neighbouring regions where possible. The band legend is hidden in this mode. Works in grid mode too, where the coloured leader lines help trace dense areas. `--verbose` reports how many neighbour pairs ended up weakly separated.
 - `--line-alpha 0.08` (or `--no-lines`) if the great-circle fan still dominates.
 - `--verbose` prints placement statistics (median / p90 / max leader length) so you can compare settings.
 
@@ -197,7 +251,7 @@ Contacts with none of the above are skipped with a `[DEBUG]` message.  For FT8/F
 ## Map Style
 
 - Dark navy ocean, dark warm-sand land (so band colours, especially 20 m green, stand out), Natural Earth 10 m coastlines and borders
-- Contacts colour-coded by band (160 m = red → 10 m = purple → VHF = pink/grey), dots outlined so they stand out over lines
+- Contacts colour-coded by band (160 m = red → 10 m = purple → VHF = pink/grey), dots outlined so they stand out over lines — or, with `--color-by region`, by region so neighbours always differ
 - Home station shown as a yellow star
 - Info boxes: grid square header in the band colour, callsigns in white, monospace, sized for zooming (image mode); grids with more than 6 callsigns wrap into columns
 - Great-circle lines fade and thin automatically as the number of contacts grows; the most common band is drawn first so rarer bands stay visible on top

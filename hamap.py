@@ -1421,6 +1421,149 @@ def group_by_entity(qsos_with_pos, args, log):
     return groups
 
 
+# Region palette: based on the dataviz reference dark categorical set (all in
+# OKLCH L 0.48-0.67 and >= 3:1 on both the navy ocean and the sand land), with
+# its green lifted from #008300 to clear 3:1 on sand, and its red swapped for a
+# neutral grey — red and magenta read alike as thin box borders; the grey cut
+# weakly separated neighbour links ~25% on a 1.6k-QSO log.  No 8-colour set
+# keeps *every* pair distinct (e.g. magenta/aqua under deuteranopia), so the
+# colouring below is palette-aware and keeps weak pairs apart where it can.
+REGION_PALETTE = ['#3987e5', '#d95926', '#199e70', '#c98500',
+                  '#d55181', '#2f9a2f', '#9085e9', '#89939e']
+_REGION_NEAR_DEG  = 1.5     # regions this close (shapes) count as neighbours
+_POINT_NEAR_DEG   = 2.5     # ... for regions without a shape (grid mode)
+_BOX_NEAR_CHARS   = 5.0     # boxes / dots this close (in char heights) too
+_REGION_GOOD_DE   = 15.0    # neighbour colour separation (ΔE) that is 'enough'
+
+
+def _palette_distances(palette):
+    """
+    Pairwise perceptual distance matrix (OKLab ΔE × 100) — the minimum over
+    normal vision and simulated deuteranopia / protanopia (Machado 2009).
+    """
+    def lin(c):
+        c = int(c, 16) / 255.0
+        return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+    def oklab(rgb):
+        r, g, b = rgb
+        l = (0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b) ** (1 / 3)
+        m = (0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b) ** (1 / 3)
+        s = (0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b) ** (1 / 3)
+        return (0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
+                1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
+                0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s)
+
+    sims = {
+        'normal': None,
+        'deutan': ((0.367322, 0.860646, -0.227968), (0.280085, 0.672501, 0.047413),
+                   (-0.011820, 0.042940, 0.968881)),
+        'protan': ((0.152286, 1.052583, -0.204868), (0.114503, 0.786281, 0.099216),
+                   (-0.003882, -0.048116, 1.051998)),
+    }
+    rgbs = [tuple(lin(h.lstrip('#')[i:i + 2]) for i in (0, 2, 4)) for h in palette]
+    labs = {}
+    for name, m in sims.items():
+        labs[name] = [oklab(rgb if m is None else tuple(
+            min(1.0, max(0.0, sum(m[r][c] * rgb[c] for c in range(3))))
+            for r in range(3))) for rgb in rgbs]
+    n = len(palette)
+    return [[min(100.0 * math.dist(labs[s][i], labs[s][j]) for s in sims)
+             for j in range(n)] for i in range(n)]
+
+
+def assign_region_colors(groups, boxes_px, ll_to_px, char_px, log):
+    """
+    Recolour groups so that neighbouring regions look clearly different.
+
+    Neighbours are regions whose shapes (or dots, without a shape) lie within a
+    small distance, plus any whose boxes or dots end up close on the page after
+    placement — ocean-placed boxes can sit together although their regions
+    don't touch.  Colouring is DSatur-style (most-constrained region first);
+    each region takes the palette colour most distinct from its coloured
+    neighbours (anything ≥ _REGION_GOOD_DE counts as distinct enough), ties
+    going to the least-used colour to keep the map balanced.
+    """
+    from shapely.geometry import Point
+    from shapely.strtree import STRtree
+
+    keys = sorted(groups)
+    idx  = {k: i for i, k in enumerate(keys)}
+    adj  = {k: set() for k in keys}
+
+    def _link(a, b):
+        if a != b:
+            adj[a].add(b)
+            adj[b].add(a)
+
+    # 1. geographic neighbours
+    for near, subset in ((_REGION_NEAR_DEG, [k for k in keys if groups[k].get('geom') is not None]),
+                         (_POINT_NEAR_DEG,  [k for k in keys if groups[k].get('geom') is None])):
+        if not subset:
+            continue
+        shapes = [groups[k]['geom'].simplify(0.05) if groups[k].get('geom') is not None
+                  else Point(groups[k]['dot_lon'], groups[k]['dot_lat']) for k in subset]
+        tree = STRtree(shapes)
+        for i, j in zip(*tree.query(shapes, predicate='dwithin', distance=near)):
+            _link(subset[i], subset[j])
+    # regions with a shape vs dot-only regions (e.g. an unmatched country)
+    shaped = [k for k in keys if groups[k].get('geom') is not None]
+    if shaped:
+        tree = STRtree([groups[k]['geom'].simplify(0.05) for k in shaped])
+        for k in keys:
+            if groups[k].get('geom') is None:
+                pt = Point(groups[k]['dot_lon'], groups[k]['dot_lat'])
+                for j in tree.query(pt, predicate='dwithin', distance=_REGION_NEAR_DEG):
+                    _link(k, shaped[j])
+
+    # 2. neighbours on the page: boxes near boxes, dots near other regions' boxes
+    near_px = _BOX_NEAR_CHARS * char_px
+    dots = {k: ll_to_px(groups[k]['dot_lon'], groups[k]['dot_lat']) for k in keys}
+    bk   = [k for k in keys if k in boxes_px]
+    for i, a in enumerate(bk):
+        ax_, ay_, ahw, ahh = boxes_px[a]
+        for b in bk[i + 1:]:
+            bx_, by_, bhw, bhh = boxes_px[b]
+            if (abs(ax_ - bx_) < ahw + bhw + near_px and
+                    abs(ay_ - by_) < ahh + bhh + near_px):
+                _link(a, b)
+        for k, (dx, dy) in dots.items():
+            if abs(dx - ax_) < ahw + near_px and abs(dy - ay_) < ahh + near_px:
+                _link(a, k)
+
+    # 3. palette-aware DSatur colouring
+    dist   = _palette_distances(REGION_PALETTE)
+    ncol   = len(REGION_PALETTE)
+    color  = {}
+    used   = [0] * ncol
+    pending = set(keys)
+    while pending:
+        k = max(pending, key=lambda v: (len({color[n] for n in adj[v] if n in color}),
+                                        len(adj[v]), -idx[v]))
+        nbr = [color[n] for n in adj[k] if n in color]
+        # Separation beyond _REGION_GOOD_DE counts as equally good, so the
+        # least-used colour wins among those instead of the same few
+        # "far from everything" hues winning every time.
+        c = max(range(ncol), key=lambda c: (
+            min(_REGION_GOOD_DE, min((dist[c][o] for o in nbr), default=1e9)),
+            -used[c], -c))
+        color[k] = c
+        used[c] += 1
+        pending.discard(k)
+
+    clashes = sum(1 for k in keys for n in adj[k] if color[n] == color[k]) // 2
+    weak = sum(1 for k in keys for n in adj[k]
+               if dist[color[k]][color[n]] < _REGION_GOOD_DE) // 2
+    log.verbose("Region colours: %d regions, %d neighbour links (max %d per region); "
+                "same colour: %d, weakly separated (ΔE < %.0f): %d",
+                len(keys), sum(len(v) for v in adj.values()) // 2,
+                max((len(v) for v in adj.values()), default=0), clashes,
+                _REGION_GOOD_DE, weak)
+    log.verbose("  colour use: %s", ' '.join(f"{REGION_PALETTE[c]}:{used[c]}" for c in range(ncol)))
+    for k in keys:
+        groups[k]['color'] = REGION_PALETTE[color[k]]
+
+
 def _summary_text(qsos_with_pos, args):
     """Multi-line text for the statistics box (station, counts, dates, filters)."""
     total       = len(qsos_with_pos)
@@ -1575,17 +1718,6 @@ def generate_map(qsos_with_pos, home_pos, args, log):
                 calls_ = info['body']
                 info['ncols'] = _dxcc_ncols(len(calls_))
 
-    # ---- Entity region tint: ties each region to its single dot and box ----
-    if entity_mode:
-        from matplotlib.colors import to_rgba
-        for info in groups.values():
-            if info.get('geom') is not None:
-                ax.add_geometries(
-                    [info['geom']], crs=proj,
-                    facecolor=to_rgba(info['color'], 0.16),
-                    edgecolor=to_rgba(info['color'], 0.45),
-                    linewidth=0.4, zorder=2.5)
-
     # ---- Fixed text labels (countries / states) — drawn first, act as obstacles
     pre_placed = []
 
@@ -1668,7 +1800,7 @@ def generate_map(qsos_with_pos, home_pos, args, log):
     s_w = (max(len(l) for l in s_lines) * 0.62 + 1.4) * s_fpt * _pt
     s_h = (len(s_lines) * 1.2 + 1.4) * s_fpt * _pt
     sizes = {'stats': (s_w, s_h)}
-    if present_bands:
+    if present_bands and args.color_by == 'band':
         l_fpt  = 16 * _geo_scale
         l_cols = max(1, len(present_bands) // 8)
         l_rows = math.ceil(len(present_bands) / l_cols)
@@ -1719,6 +1851,22 @@ def generate_map(qsos_with_pos, home_pos, args, log):
                                            land_prep=_land_prep)
     else:
         label_pos, boxes_px = {}, {}
+
+    # ---- Region colouring: neighbours get clearly different colours -------
+    if args.color_by == 'region':
+        assign_region_colors(groups, boxes_px, ll_to_px,
+                             args.font_size * args.dpi / 72.0, log)
+
+    # ---- Entity region tint: ties each region to its single dot and box ----
+    if entity_mode:
+        from matplotlib.colors import to_rgba
+        for info in groups.values():
+            if info.get('geom') is not None:
+                ax.add_geometries(
+                    [info['geom']], crs=proj,
+                    facecolor=to_rgba(info['color'], 0.16),
+                    edgecolor=to_rgba(info['color'], 0.45),
+                    linewidth=0.4, zorder=2.5)
 
     # ---- Great-circle lines (one arc per unique dot) ---------------------
     if home_pos and not args.no_lines:
@@ -1870,7 +2018,7 @@ def generate_map(qsos_with_pos, home_pos, args, log):
     legend_patches = [
         mpatches.Patch(color=BAND_COLORS.get(b, UNKNOWN_COLOR), label=b)
         for b in present_bands
-    ]
+    ] if args.color_by == 'band' else []
     if legend_patches:
         leg = ax.legend(
             handles=legend_patches,
@@ -2348,7 +2496,27 @@ def filter_records(records, args, log):
 # Argument parsing
 # --------------------------------------------------------------------------- #
 
-def parse_args():
+def _box_calls_arg(s):
+    """--box-calls value: 'all' (no cap) or a non-negative integer."""
+    if s.lower() == 'all':
+        return None
+    n = int(s)
+    if n < 0:
+        raise argparse.ArgumentTypeError("must be 'all' or >= 0")
+    return n
+
+
+def _line_alpha_arg(s):
+    """--line-alpha value: 'auto' or an opacity 0..1."""
+    if s.lower() == 'auto':
+        return None
+    a = float(s)
+    if not 0.0 <= a <= 1.0:
+        raise argparse.ArgumentTypeError("must be 'auto' or between 0 and 1")
+    return a
+
+
+def build_parser():
     p = argparse.ArgumentParser(
         prog='hamap',
         description='Generate a high-resolution world map from an ADIF ham radio log.',
@@ -2366,9 +2534,20 @@ def parse_args():
             "  hamap contacts.adif --start 2025-01-01 --end 2025-03-31\n"
             "  hamap contacts.adif --tail-days 30\n"
             "  hamap contacts.adif --tail 500\n"
+            "  hamap contacts.adif --profile big --box-calls 20\n"
+            "  hamap contacts.adif --show-config        # effective settings + sources\n"
             "  hamap --setup\n"
         ),
     )
+    prof = p.add_argument_group('profiles')
+    prof.add_argument('--profile', metavar='NAME',
+                      help="Settings preset: 'auto' (default: picks small or big from "
+                           "the log size), 'small', 'big', or one defined in the config "
+                           "file. Command-line options override the profile.")
+    prof.add_argument('--config', metavar='FILE',
+                      help='Profile config file (default: ~/.hamap/config.ini)')
+    prof.add_argument('--show-config', action='store_true',
+                      help='Print the effective settings and where each came from, then exit')
     p.add_argument('adif_file', metavar='FILE', nargs='?',
                    help='ADIF log file to map')
     p.add_argument('--output', '-o', metavar='FILE',
@@ -2386,11 +2565,15 @@ def parse_args():
                    help='Home station Maidenhead grid square (e.g. EN82)')
     p.add_argument('--no-lines', action='store_true',
                    help='Skip great-circle lines to contacts')
-    p.add_argument('--line-alpha', type=float, metavar='A',
-                   help='Great-circle line opacity 0..1 (default: auto, '
-                        '0.45 for small logs fading to 0.12 for large ones)')
+    p.add_argument('--lines', dest='no_lines', action='store_false',
+                   help='Draw great-circle lines (undoes --no-lines from a profile)')
+    p.add_argument('--line-alpha', type=_line_alpha_arg, metavar='A',
+                   help="Great-circle line opacity 0..1 or 'auto' (default: auto, "
+                        "0.45 for small logs fading to 0.12 for large ones)")
     p.add_argument('--no-labels', action='store_true',
                    help='Skip callsign labels on the map')
+    p.add_argument('--labels', dest='no_labels', action='store_false',
+                   help='Draw callsign labels (undoes --no-labels from a profile)')
     p.add_argument('--dpi', type=int, default=300,
                    help='Output resolution in DPI (default: 300)')
     p.add_argument('--width', type=float, default=48.0,
@@ -2407,20 +2590,24 @@ def parse_args():
     p.add_argument('--group-by', choices=('grid', 'entity'), default='grid',
                    help='One info box per grid square (default) or per entity: '
                         'US state / Canadian province, else country')
-    p.add_argument('--box-calls', type=int, metavar='N',
-                   help='Callsigns per info box: omit for all, N for the N busiest '
-                        'plus "+k more", 0 for a summary (counts per band)')
-    p.add_argument('--ocean-boxes', action='store_true',
+    p.add_argument('--box-calls', type=_box_calls_arg, metavar='N',
+                   help="Callsigns per info box: 'all' (default), N for the N busiest "
+                        'plus a "+k more" footer, 0 for a summary (counts per band)')
+    p.add_argument('--color-by', choices=('band', 'region'), default='band',
+                   help='What dot/line/box colour means: band (default; most common '
+                        'band) or region (neighbouring regions get distinct colours, '
+                        'so it is obvious which dot, line and box belong together)')
+    p.add_argument('--ocean-boxes', action=argparse.BooleanOptionalAction, default=False,
                    help='Prefer placing info boxes over open water (within '
                         '--ocean-reach of their dot), leaving land for inland boxes')
     p.add_argument('--ocean-reach', type=float, default=8.0, metavar='DEG',
                    help='How far (degrees) a box may move to reach open water '
                         '(default: 8)')
-    p.add_argument('--truncate-grids', action='store_true',
+    p.add_argument('--truncate-grids', action=argparse.BooleanOptionalAction, default=False,
                    help='Reduce grid squares to 4-character accuracy before grouping')
-    p.add_argument('--label-countries', action='store_true',
+    p.add_argument('--label-countries', action=argparse.BooleanOptionalAction, default=False,
                    help='Draw country name labels at centroid positions')
-    p.add_argument('--label-states', action='store_true',
+    p.add_argument('--label-states', action=argparse.BooleanOptionalAction, default=False,
                    help='Draw US state / Canadian province labels at centroid positions')
     p.add_argument('--dxcc', action='store_true',
                    help='DXCC mode: flood-fill LoTW-confirmed entities, one box per entity')
@@ -2448,7 +2635,197 @@ def parse_args():
     p.add_argument('--syslog', action='store_true',
                    help='Also send log output to syslog')
 
-    return p.parse_args()
+    return p
+
+
+# --------------------------------------------------------------------------- #
+# Profiles:  built-in defaults  <  profile (+ what it extends)  <  command line
+# --------------------------------------------------------------------------- #
+
+# Built-in profiles, keyed by long option name (as in the config file)
+BUILTIN_PROFILES = {
+    'small': {},
+    'big': {
+        'truncate-grids':  True,
+        'label-countries': True,
+        'label-states':    True,
+        'group-by':        'entity',
+        'box-calls':       12,
+        'ocean-boxes':     True,
+        'color-by':        'region',
+        'width':           64,
+    },
+}
+_AUTO_BIG_GRIDS = 300      # 'auto' picks big at or above this many 4-char grids
+
+# Options that name inputs/outputs or control the profile system itself
+_NOT_IN_PROFILES = {'adif_file', 'output', 'profile', 'config', 'show_config',
+                    'setup', 'help',
+                    'preview'}     # picks the matplotlib backend before profiles load
+_UNSET = object()
+
+
+class Profiles:
+    """
+    Resolves a profile name into a full argparse Namespace.
+
+    Config file format (INI), keys are long option names without dashes:
+
+        [defaults]
+        profile = big
+
+        [profile:poster]
+        extends = big
+        width   = 80
+        extent  = full
+
+    A config profile with a built-in's name replaces the built-in; use
+    'extends' to build on one instead.
+    """
+
+    def __init__(self, parser, defaults, explicit, config_path):
+        self.parser   = parser
+        self.defaults = defaults
+        self.explicit = explicit
+        self.actions  = {s[2:]: a for a in parser._actions
+                         for s in a.option_strings if s.startswith('--')}
+        self.profiles = {n: {'extends': None, 'values': list(v.items()), 'from': 'built-in'}
+                         for n, v in BUILTIN_PROFILES.items()}
+        self.default_profile = None
+        self.config_path     = config_path
+        if config_path and os.path.exists(config_path):
+            cp = configparser.ConfigParser(inline_comment_prefixes=('#', ';'))
+            try:
+                cp.read(config_path)
+            except configparser.Error as exc:
+                parser.error(f"{config_path}: {exc}")
+            for sec in cp.sections():
+                if sec.startswith('profile:'):
+                    body = dict(cp[sec])
+                    self.profiles[sec.split(':', 1)[1].strip()] = {
+                        'extends': body.pop('extends', None),
+                        'values':  list(body.items()),
+                        'from':    config_path,
+                    }
+                elif sec == 'defaults':
+                    self.default_profile = cp[sec].get('profile')
+
+    def _convert(self, pname, key, raw):
+        """(dest, value) for one profile entry, validated like the command line."""
+        a = self.actions.get(key)
+        if a is None or a.dest in _NOT_IN_PROFILES:
+            self.parser.error(f"profile '{pname}': unknown or unsupported option '{key}'")
+        if a.nargs == 0:                                   # on/off flag
+            if isinstance(raw, bool):
+                on = raw
+            elif str(raw).lower() in ('1', 'yes', 'true', 'on'):
+                on = True
+            elif str(raw).lower() in ('0', 'no', 'false', 'off'):
+                on = False
+            else:
+                self.parser.error(f"profile '{pname}': {key} needs yes/no, got {raw!r}")
+            if isinstance(a, argparse.BooleanOptionalAction):
+                return a.dest, (not on) if key.startswith('no-') else on
+            return a.dest, on if a.const else not on       # store_true / store_false
+        try:
+            val = a.type(str(raw)) if a.type else raw
+        except (ValueError, argparse.ArgumentTypeError) as exc:
+            self.parser.error(f"profile '{pname}': {key}: {exc}")
+        if a.choices and val not in a.choices:
+            self.parser.error(f"profile '{pname}': {key} must be one of "
+                              f"{', '.join(map(str, a.choices))}")
+        return a.dest, val
+
+    def names(self):
+        return sorted(self.profiles)
+
+    def resolve(self, name):
+        chain, n = [], name
+        while n:
+            if n in chain:
+                self.parser.error(f"profile '{name}': 'extends' loop at '{n}'")
+            if n not in self.profiles:
+                self.parser.error(f"unknown profile '{n}' (available: auto, "
+                                  f"{', '.join(self.names())})")
+            chain.append(n)
+            n = self.profiles[n]['extends']
+
+        values  = dict(self.defaults)
+        sources = {k: 'default' for k in values}
+        for pname in reversed(chain):                      # base profile first
+            for key, raw in self.profiles[pname]['values']:
+                dest, val = self._convert(pname, key, raw)
+                values[dest], sources[dest] = val, f'profile {pname}'
+        for k, v in self.explicit.items():
+            values[k], sources[k] = v, 'command line'
+
+        args = argparse.Namespace(**values)
+        args.profile, args.profile_chain = name, chain
+        args.profile_sources, args.profiles = sources, self
+        args.profile_note = ''
+        return args
+
+
+def parse_args(argv=None):
+    """
+    Parse the command line and apply the selected profile.
+
+    With profile 'auto' the returned args use 'small' provisionally
+    (args.profile == 'auto'); main() re-resolves once the log is read.
+    """
+    parser   = build_parser()
+    defaults = vars(parser.parse_args([]))
+
+    # Parse again with every default replaced by a sentinel, so options typed
+    # on the command line are known even when they equal the default.
+    probe = build_parser()
+    probe.set_defaults(**{k: _UNSET for k in defaults})
+    explicit = {k: v for k, v in vars(probe.parse_args(argv)).items() if v is not _UNSET}
+
+    config_path = explicit.get('config') or os.path.join(HAMAP_DIR, 'config.ini')
+    if explicit.get('config') and not os.path.exists(config_path):
+        parser.error(f"config file not found: {config_path}")
+    profiles = Profiles(parser, defaults, explicit, config_path)
+    name     = explicit.get('profile') or profiles.default_profile or 'auto'
+
+    args = profiles.resolve('small' if name == 'auto' else name)
+    args.profile = name
+    return args
+
+
+def choose_auto_profile(args, records, log):
+    """Resolve profile 'auto' from the (filtered) log size; returns new args."""
+    n4 = len({r.get('GRIDSQUARE', '').strip().upper()[:4]
+              for r in records if r.get('GRIDSQUARE', '').strip()})
+    chosen = 'big' if n4 >= _AUTO_BIG_GRIDS else 'small'
+    new = args.profiles.resolve(chosen)
+    new.profile_note = (f"auto → {chosen} ({n4} distinct 4-char grids; "
+                        f"big at ≥ {_AUTO_BIG_GRIDS})")
+    log.info("Profile: %s", new.profile_note)
+    return new
+
+
+def show_config(args):
+    """Print effective settings and their sources."""
+    src = args.profile_sources
+    print(f"Profile: {args.profile_note or args.profile}"
+          + (f"  (chain: {' → '.join(args.profile_chain)})"
+             if len(args.profile_chain) > 1 else ''))
+    cfg = args.profiles.config_path
+    print(f"Config:  {cfg}{'' if cfg and os.path.exists(cfg) else '  (not found)'}")
+    print(f"Profiles available: auto, {', '.join(args.profiles.names())}")
+    print()
+    skip = _NOT_IN_PROFILES | {'height'}
+    for dest in sorted(k for k in src if k not in skip):
+        val = getattr(args, dest)
+        if val is None:
+            shown = {'box_calls': 'all', 'line_alpha': 'auto'}.get(dest, '-')
+        elif isinstance(val, bool):
+            shown = 'yes' if val else 'no'
+        else:
+            shown = val
+        mark = '' if src[dest] == 'default' else '  *'
+        print(f"  {dest.replace('_', '-'):<16} {str(shown):<14} {src[dest]}{mark}")
 
 
 # --------------------------------------------------------------------------- #
@@ -2464,6 +2841,11 @@ def main():
         return
 
     if not args.adif_file:
+        if args.show_config:
+            if args.profile == 'auto':
+                args.profile_note = "auto (decided per log: give a FILE to see which)"
+            show_config(args)
+            return
         log.error("No ADIF file specified. Use --help for usage.")
         sys.exit(1)
 
@@ -2476,6 +2858,15 @@ def main():
     if not records:
         log.error("No QSOs remain after filtering.")
         sys.exit(1)
+
+    # ---- Resolve profile 'auto' now that the log size is known -----------
+    if args.profile == 'auto':
+        args = choose_auto_profile(args, records, log)
+    else:
+        log.verbose("Profile: %s", ' → '.join(args.profile_chain))
+    if args.show_config:
+        show_config(args)
+        return
 
     # ---- DXCC mode: keep only LoTW-confirmed QSOs ------------------------
     if args.dxcc:
