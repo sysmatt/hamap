@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hamap"
+version = "0.2.0"
+description = "High-resolution ham radio contact map generator from ADIF logs"
+readme = "README.md"
+license = { text = "GPL-3.0-or-later" }
+authors = [{ name = "Matt Hoskins" }]
+requires-python = ">=3.9"
+dependencies = [
+    "matplotlib>=3.7",
+    "cartopy>=0.22",
+    "numpy>=1.24",
+    "shapely>=2.0",
+    "plotly>=5.0",
+]
+
+[project.scripts]
+hamap = "hamap:main"
+
+[tool.setuptools]
+py-modules = ["hamap"]
