@@ -65,6 +65,8 @@ Options:
   --no-lines / --lines  Skip / draw great-circle lines
   --line-alpha A        Great-circle line opacity 0..1, or auto (default: 0.45 for
                         small logs, fading toward 0.12 as contacts grow)
+  --line-width PT       Great-circle line width in points, or auto (default: 0.8
+                        for small logs, thinning toward 0.4 as contacts grow)
   --no-labels / --labels  Skip / draw callsign labels (image mode)
   --dpi N               Output DPI (default: 300)
   --width N             Figure width in inches (default: 48); height follows the extent
@@ -166,7 +168,7 @@ So `hamap log.adi --profile big --box-calls 20` uses everything from `big` excep
 |---------|----------|
 | `auto` *(default)* | Picks `small` or `big` after reading the log: `big` at ≥ 300 distinct 4-character grids (counted after date/tail filters). |
 | `small` | The plain defaults: one box per grid, all callsigns, 48 in wide. |
-| `big` | `--truncate-grids --group-by entity --box-calls 12 --ocean-boxes --color-by region --label-countries --label-states --width 64` |
+| `big` | `--truncate-grids --group-by entity --box-calls 12 --ocean-boxes --color-by region --line-alpha 0.40 --line-width 0.4 --label-countries --label-states --width 64` |
 
 Run `hamap log.adi --show-config` to see the effective settings, which profile `auto` picked, and where each value came from (`*` marks anything not at its built-in default).
 

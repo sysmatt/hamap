@@ -1877,7 +1877,7 @@ def generate_map(qsos_with_pos, home_pos, args, log):
         n_lines = len(line_dots)
         density = min(1.0, math.sqrt(40.0 / max(n_lines, 1)))
         l_alpha = args.line_alpha if args.line_alpha is not None else max(0.12, 0.45 * density)
-        l_width = max(0.4, 0.8 * density)
+        l_width = args.line_width if args.line_width is not None else max(0.4, 0.8 * density)
         log.verbose("Drawing %d great-circle lines (alpha %.2f, width %.2f)...",
                     n_lines, l_alpha, l_width)
         # Most common colour first, so rarer bands draw on top of it
@@ -2516,6 +2516,16 @@ def _line_alpha_arg(s):
     return a
 
 
+def _line_width_arg(s):
+    """--line-width value: 'auto' or a width in points > 0."""
+    if s.lower() == 'auto':
+        return None
+    w = float(s)
+    if w <= 0:
+        raise argparse.ArgumentTypeError("must be 'auto' or > 0")
+    return w
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         prog='hamap',
@@ -2570,6 +2580,9 @@ def build_parser():
     p.add_argument('--line-alpha', type=_line_alpha_arg, metavar='A',
                    help="Great-circle line opacity 0..1 or 'auto' (default: auto, "
                         "0.45 for small logs fading to 0.12 for large ones)")
+    p.add_argument('--line-width', type=_line_width_arg, metavar='PT',
+                   help="Great-circle line width in points, or 'auto' (default: auto, "
+                        "0.8 for small logs thinning to 0.4 for large ones)")
     p.add_argument('--no-labels', action='store_true',
                    help='Skip callsign labels on the map')
     p.add_argument('--labels', dest='no_labels', action='store_false',
@@ -2653,6 +2666,8 @@ BUILTIN_PROFILES = {
         'box-calls':       12,
         'ocean-boxes':     True,
         'color-by':        'region',
+        'line-alpha':      0.40,
+        'line-width':      0.4,
         'width':           64,
     },
 }
@@ -2819,7 +2834,8 @@ def show_config(args):
     for dest in sorted(k for k in src if k not in skip):
         val = getattr(args, dest)
         if val is None:
-            shown = {'box_calls': 'all', 'line_alpha': 'auto'}.get(dest, '-')
+            shown = {'box_calls': 'all', 'line_alpha': 'auto',
+                     'line_width': 'auto'}.get(dest, '-')
         elif isinstance(val, bool):
             shown = 'yes' if val else 'no'
         else:
