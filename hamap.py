@@ -1753,6 +1753,25 @@ def assign_colors(index, cu, groups, boxes_px, ll_to_px, char_px, log):
     return {k: REGION_PALETTE[color[k]] for k in keys}
 
 
+def _station_call(qsos_with_pos):
+    return next((qso.get(f) for qso, _ in qsos_with_pos
+                 for f in ('STATION_CALLSIGN', 'OPERATOR') if qso.get(f)), '')
+
+
+def _filter_rows(args):
+    """(label, value) rows describing the command-line QSO filters in effect."""
+    rows = []
+    if getattr(args, 'start', None):
+        rows.append(('Start:', _fmt_date(args.start)))
+    if getattr(args, 'end', None):
+        rows.append(('End:', _fmt_date(args.end)))
+    if getattr(args, 'tail_days', None) is not None:
+        rows.append(('Tail days:', f"{args.tail_days:,}"))
+    if getattr(args, 'tail', None) is not None:
+        rows.append(('Tail recs:', f"{args.tail:,}"))
+    return rows
+
+
 def _summary_text(qsos_with_pos, args, index=None):
     """Multi-line text for the statistics box (station, counts, dates, filters)."""
     total       = len(qsos_with_pos)
@@ -1766,8 +1785,7 @@ def _summary_text(qsos_with_pos, args, index=None):
 
     dates = sorted(qso.get('QSO_DATE', '') for qso, _ in qsos_with_pos
                    if qso.get('QSO_DATE'))
-    station = next((qso.get(f) for qso, _ in qsos_with_pos
-                    for f in ('STATION_CALLSIGN', 'OPERATOR') if qso.get(f)), '')
+    station = _station_call(qsos_with_pos)
 
     # (label, value) rows; None is a separator rule
     rows = [('Contacts:', f"{total:,}"),
@@ -1794,15 +1812,7 @@ def _summary_text(qsos_with_pos, args, index=None):
         rows += [None, ('First QSO:', _fmt_date(dates[0])),
                  ('Last QSO:', _fmt_date(dates[-1]))]
 
-    filter_rows = []
-    if getattr(args, 'start', None):
-        filter_rows.append(('Start:', _fmt_date(args.start)))
-    if getattr(args, 'end', None):
-        filter_rows.append(('End:', _fmt_date(args.end)))
-    if getattr(args, 'tail_days', None) is not None:
-        filter_rows.append(('Tail days:', f"{args.tail_days:,}"))
-    if getattr(args, 'tail', None) is not None:
-        filter_rows.append(('Tail recs:', f"{args.tail:,}"))
+    filter_rows = _filter_rows(args)
     if filter_rows:
         rows += [None] + filter_rows
 
@@ -2405,6 +2415,13 @@ def generate_html_plotly(qsos_with_pos, args, home_pos, out_path, log):
             'color': [pal_idx[U['colors'][k]] for k in U['keys']],
             'maj':   maj,
         }
+    # For live stats: real 4-char grids, real countries, US/CA regions
+    k4 = units['grid4']['keys']
+    payload_units['grid4']['real'] = [1 if re.match(r'^[A-R]{2}[0-9]{2}$', k) else 0 for k in k4]
+    payload_units['country']['real'] = [1 if k.startswith('C:') else 0
+                                        for k in units['country']['keys']]
+    payload_units['region']['kind'] = [k[:3] if k[:4] in ('USA-', 'CAN-') else ''
+                                       for k in units['region']['keys']]
 
     # [call, band, name, date, qth].  Deliberately no QSO time: the HTML is
     # meant to be shared, and exact contact times are too much to publish.
@@ -2588,7 +2605,8 @@ def generate_html_plotly(qsos_with_pos, args, home_pos, out_path, log):
         'bandCount': {b: band_qsos[b] for b in bands}, 'bandColor': band_clr,
         'home': list(home_pos) if home_pos else None,
         'lineAlpha': args.line_alpha, 'start': start,
-        'stats': _summary_text(qsos_with_pos, args, index),
+        'station': _station_call(qsos_with_pos).upper(),
+        'filters': _filter_rows(args),
     }
     script = ('var HAMAP = ' + json.dumps(payload, separators=(',', ':')) + ';\n'
               + _HTML_APP_JS)
@@ -2613,6 +2631,29 @@ _HTML_APP_JS = r"""
   var S = JSON.parse(JSON.stringify(H.start));
   S.bands = {}; H.bands.forEach(function (b) { S.bands[b] = true; });
   var pinned = {}, zTop = 10000, gd, panelOpen = true;
+
+  // ---- dates: QSO day numbers (days since 1970), full range, current range --
+  var NQ = H.qsos.length, qDay = new Array(NQ), dMin = Infinity, dMax = -Infinity;
+  function toDay(s) {
+    var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s || '');
+    return m ? Date.UTC(+m[1], +m[2] - 1, +m[3]) / 864e5 : null;
+  }
+  function dayStr(d) { return new Date(d * 864e5).toISOString().slice(0, 10); }
+  for (var qi0 = 0; qi0 < NQ; qi0++) {
+    var d0 = toDay(H.qsos[qi0][3]); qDay[qi0] = d0;
+    if (d0 !== null) { if (d0 < dMin) dMin = d0; if (d0 > dMax) dMax = d0; }
+  }
+  var hasDates = dMin <= dMax;
+  S.from = dMin; S.to = dMax;
+  function fullRange() { return !hasDates || (S.from <= dMin && S.to >= dMax); }
+  var dateOk = new Uint8Array(NQ);            // per QSO: inside the date range?
+  function updateDateOk() {
+    var full = fullRange();
+    for (var i = 0; i < NQ; i++) {
+      // undated QSOs show only while the whole range is selected
+      dateOk[i] = full ? 1 : (qDay[i] !== null && qDay[i] >= S.from && qDay[i] <= S.to) ? 1 : 0;
+    }
+  }
   try { if (localStorage.getItem('hamap.panel') === '0') panelOpen = false; } catch (e) {}
 
   // ---- URL hash: #fill=..&dots=..&bands=20m,40m&lines=0&pin=Ohio ----------
@@ -2625,12 +2666,14 @@ _HTML_APP_JS = r"""
     else if (k === 'pin') pinReq = v.split(',');
     else if (k === 'panel') panelOpen = v !== '0';
     else if (k === 'view') S.view = v.split(',').map(Number);   // lat,lon,zoom
+    else if ((k === 'from' || k === 'to') && toDay(v) !== null && hasDates)
+      S[k] = Math.min(dMax, Math.max(dMin, toDay(v)));
     else if (k in S) S[k] = (v === '1' || v === 'true' || v === 'on');
   });
 
   function esc(s) { return String(s).replace(/[&<>"]/g, function (c) {
     return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c]; }); }
-  function active(qi) { return S.bands[H.qsos[qi][1]]; }
+  function active(qi) { return dateOk[qi] && S.bands[H.qsos[qi][1]]; }
   function groupActive(u, gi) { return H.units[u].q[gi].some(active); }
   function colorUnit() {
     var us = [S.dots, S.fill].filter(function (u) { return u && u !== 'none'; });
@@ -2664,6 +2707,8 @@ _HTML_APP_JS = r"""
   // ---- render: rebuild every dynamic trace from the state -----------------
   function render() {
     var D = gd.data;
+    if (S.from > S.to) { var t = S.from; S.from = S.to; S.to = t; }
+    updateDateOk();
     H.order.forEach(function (u) {
       var U = H.units[u], n = U.label.length;
       // fill
@@ -2716,6 +2761,7 @@ _HTML_APP_JS = r"""
     Plotly.react(gd, D, gd.layout);
     Object.keys(pinned).forEach(function (k) { pinned[k].refresh(); });
     if (gd) reposition();
+    updatePanelCounts();
     writeHash();
   }
 
@@ -2726,6 +2772,7 @@ _HTML_APP_JS = r"""
     ['lines', 'labels', 'cnames', 'snames', 'borders', 'gfields', 'gsquares'].forEach(function (k) {
       if (S[k] !== H.start[k]) h += '&' + k + '=' + (S[k] ? 1 : 0);
     });
+    if (!fullRange()) h += '&from=' + dayStr(S.from) + '&to=' + dayStr(S.to);
     if (S.view) h += '&view=' + S.view.map(function (x) { return +x.toFixed(2); }).join(',');
     history.replaceState(null, '', '#' + h);
   }
@@ -2739,7 +2786,7 @@ _HTML_APP_JS = r"""
     var h = '<div style="font-weight:bold;color:' + c + ';font-size:15px">' + esc(U.label[gi]) + '</div>'
           + '<div style="color:#8899aa;margin-bottom:6px">' + qs.length + ' QSO' + (qs.length === 1 ? '' : 's')
           + ' · ' + Object.keys(calls).length + ' call' + (Object.keys(calls).length === 1 ? '' : 's') + '</div>';
-    if (!qs.length) return h + '<div style="color:#8899aa">No QSOs on the selected bands</div>';
+    if (!qs.length) return h + '<div style="color:#8899aa">No QSOs on the selected bands / dates</div>';
     H.bands.forEach(function (b) {
       var rows = byBand[b]; if (!rows) return;
       rows.sort(function (x, y) { return (x[0] + x[3]).localeCompare(y[0] + y[3]); });
@@ -2892,12 +2939,14 @@ _HTML_APP_JS = r"""
       if (x[1] === 'lines' && !H.home) return;
       lay.appendChild(check(x[0], x[1])[0]); });
     body.appendChild(lay);
+    if (hasDates) body.appendChild(datesSection());
     var bd = document.createElement('div');
     bd.innerHTML = '<div style="color:#8899aa;margin-top:6px">QSOs by band</div>';
     var boxes = [];
     H.bands.forEach(function (b) {
-      var w = check((b + '        ').slice(0, 6) + String(H.bandCount[b]).padStart(6), '#' + b, H.bandColor[b]);
+      var w = check(bandLabel(b, H.bandCount[b]), '#' + b, H.bandColor[b]);
       w[0].style.whiteSpace = 'pre'; boxes.push([b, w[1]]); bd.appendChild(w[0]);
+      bandText[b] = w[0].lastChild;
     });
     var btns = document.createElement('div'); btns.style.marginTop = '3px';
     [['all', true], ['none', false]].forEach(function (x) {
@@ -2913,9 +2962,153 @@ _HTML_APP_JS = r"""
     return p;
   }
 
+  function statsText() {
+    var calls = {}, g4 = {}, ct = {}, us = {}, ca = {}, n = 0, lo = Infinity, hi = -Infinity;
+    for (var i = 0; i < NQ; i++) {
+      if (!active(i)) continue;
+      n++; calls[H.qsos[i][0]] = 1;
+      if (H.units.grid4.real[qUnit.grid4[i]]) g4[qUnit.grid4[i]] = 1;
+      if (H.units.country.real[qUnit.country[i]]) ct[qUnit.country[i]] = 1;
+      var kind = H.units.region.kind[qUnit.region[i]];
+      if (kind === 'USA') us[qUnit.region[i]] = 1; else if (kind === 'CAN') ca[qUnit.region[i]] = 1;
+      if (qDay[i] !== null) { if (qDay[i] < lo) lo = qDay[i]; if (qDay[i] > hi) hi = qDay[i]; }
+    }
+    function cnt(o) { return Object.keys(o).length.toLocaleString('en-US'); }
+    var rows = [['Contacts:', n.toLocaleString('en-US')], ['Grids:', cnt(g4)],
+                ['Callsigns:', cnt(calls)], ['Countries:', cnt(ct)]];
+    if (Object.keys(us).length) rows.push(['US states:', cnt(us)]);
+    if (Object.keys(ca).length) rows.push(['CA provinces:', cnt(ca)]);
+    if (lo <= hi) rows.push(null, ['First QSO:', dayStr(lo)], ['Last QSO:', dayStr(hi)]);
+    if (H.filters.length) { rows.push(null); rows = rows.concat(H.filters); }
+    var w = 0, vw = 0;
+    rows.forEach(function (r) { if (r) { w = Math.max(w, r[0].length + 2); vw = Math.max(vw, r[1].length); } });
+    var out = [];
+    if (H.station) {
+      var pad = Math.max(0, w + vw - H.station.length), l = Math.floor(pad / 2);
+      out.push(' '.repeat(l) + H.station + ' '.repeat(pad - l));
+    }
+    rows.forEach(function (r) {
+      out.push(r ? (r[0] + ' '.repeat(w)).slice(0, w) + (' '.repeat(vw) + r[1]).slice(-vw)
+                 : '\u2500'.repeat(w + vw));
+    });
+    return out.join('\n');
+  }
+
+  var bandText = {}, statsEl = null, dateUI = null;
+  function bandLabel(b, n) { return (b + '        ').slice(0, 6) + String(n).padStart(6); }
+
+  // QSO index → group index, per unit (for live stats)
+  var qUnit = {};
+  H.order.forEach(function (u) {
+    var a = new Int32Array(NQ);
+    H.units[u].q.forEach(function (qs, gi) { qs.forEach(function (qi) { a[qi] = gi; }); });
+    qUnit[u] = a;
+  });
+
+  // ---- Dates: activity histogram + two-handle day slider ---------------------
+  function datesSection() {
+    var span = dMax - dMin + 1, bin = span <= 120 ? 1 : span <= 1100 ? 7 : 30;
+    var nb = Math.ceil(span / bin), W = 400, Hh = 34, dpr = window.devicePixelRatio || 1;
+    var d = document.createElement('div');
+    d.innerHTML = '<div style="color:#8899aa;margin-top:6px">Dates <span style="color:#5a7a9a">'
+      + '(QSOs per ' + (bin === 1 ? 'day' : bin === 7 ? 'week' : 'month') + ')</span></div>';
+    var cv = document.createElement('canvas');
+    cv.width = W * dpr; cv.height = Hh * dpr;
+    cv.style.cssText = 'display:block;width:' + W + 'px;height:' + Hh + 'px;margin-top:3px';
+    var wrap = document.createElement('div');
+    wrap.style.cssText = 'position:relative;width:' + W + 'px;height:18px';
+    var track = document.createElement('div');
+    track.style.cssText = 'position:absolute;left:0;right:0;top:8px;height:2px;background:#2a4058';
+    var sel = document.createElement('div');
+    sel.style.cssText = 'position:absolute;top:7px;height:4px;background:#7fb0e0;border-radius:2px';
+    wrap.appendChild(track); wrap.appendChild(sel);
+    function slider(key) {
+      var r = document.createElement('input');
+      r.type = 'range'; r.className = 'hm-range'; r.min = dMin; r.max = dMax; r.step = 1;
+      r.value = S[key];
+      r.oninput = function () {
+        S[key] = +r.value;
+        // a handle pushes the other along instead of stopping at it, so two
+        // handles on the same day can always be pulled apart again
+        if (S.from > S.to) {
+          if (key === 'from') { S.to = S.from; dateUI.rTo.value = S.to; }
+          else { S.from = S.to; dateUI.rFrom.value = S.from; }
+        }
+        drawDates(); scheduleRender();
+      };
+      r.onchange = function () { renderNow(); };
+      wrap.appendChild(r);
+      return r;
+    }
+    var rFrom = slider('from'), rTo = slider('to');
+    var lab = document.createElement('div');
+    lab.style.cssText = 'display:flex;justify-content:space-between;width:' + W + 'px;color:#c8d8e8';
+    var txt = document.createElement('span');
+    var rst = document.createElement('a');
+    rst.textContent = 'all dates'; rst.href = '#';
+    rst.style.cssText = 'color:#6a9ac8;text-decoration:none';
+    rst.onclick = function (e) {
+      e.preventDefault(); S.from = dMin; S.to = dMax; rFrom.value = dMin; rTo.value = dMax;
+      drawDates(); renderNow();
+    };
+    lab.appendChild(txt); lab.appendChild(rst);
+    d.appendChild(cv); d.appendChild(wrap); d.appendChild(lab);
+    dateUI = {cv: cv, sel: sel, txt: txt, rst: rst, rFrom: rFrom, rTo: rTo,
+              bin: bin, nb: nb, W: W, H: Hh, dpr: dpr, counts: null};
+    return d;
+  }
+
+  function histCounts() {          // QSOs on ticked bands, per bin
+    var c = new Array(dateUI.nb).fill(0);
+    for (var i = 0; i < NQ; i++) {
+      if (qDay[i] === null || !S.bands[H.qsos[i][1]]) continue;
+      c[Math.floor((qDay[i] - dMin) / dateUI.bin)]++;
+    }
+    dateUI.counts = c;
+  }
+
+  function drawDates() {
+    if (!dateUI) return;
+    var U = dateUI, g = U.cv.getContext('2d'), c = U.counts, mx = Math.max.apply(null, c.concat([1]));
+    g.setTransform(U.dpr, 0, 0, U.dpr, 0, 0);
+    g.clearRect(0, 0, U.W, U.H);
+    var bw = U.W / U.nb;
+    for (var b = 0; b < U.nb; b++) {
+      if (!c[b]) continue;
+      var d0 = dMin + b * U.bin, inR = d0 + U.bin - 1 >= S.from && d0 <= S.to;
+      var h = Math.max(1.5, (U.H - 2) * Math.sqrt(c[b] / mx));   // sqrt: quiet weeks stay visible
+      g.fillStyle = inR ? '#7fb0e0' : '#2e4a66';
+      g.fillRect(b * bw + (bw > 3 ? 0.5 : 0), U.H - h, Math.max(1, bw - (bw > 3 ? 1 : 0)), h);
+    }
+    var span = Math.max(1, dMax - dMin);
+    U.sel.style.left = ((S.from - dMin) / span * 100) + '%';
+    U.sel.style.width = ((S.to - S.from) / span * 100) + '%';
+    var days = S.to - S.from + 1;
+    U.txt.textContent = dayStr(S.from) + ' \u2192 ' + dayStr(S.to) + '  (' + days + ' day' + (days === 1 ? '' : 's') + ')';
+    U.rst.style.visibility = fullRange() ? 'hidden' : 'visible';
+  }
+
+  // Dragging redraws the map a few times a second, then once more on release
+  var pend = null, lastRender = 0;
+  function scheduleRender() {
+    if (pend) return;
+    pend = setTimeout(function () { pend = null; render(); },
+                      Math.max(0, 150 - (Date.now() - lastRender)));
+  }
+  function renderNow() { if (pend) { clearTimeout(pend); pend = null; } render(); }
+
+  function updatePanelCounts() {
+    lastRender = Date.now();
+    var per = {};
+    for (var i = 0; i < NQ; i++) if (dateOk[i]) per[H.qsos[i][1]] = (per[H.qsos[i][1]] || 0) + 1;
+    H.bands.forEach(function (b) { if (bandText[b]) bandText[b].nodeValue = ' ' + bandLabel(b, per[b] || 0); });
+    if (statsEl) statsEl.textContent = statsText();
+    if (dateUI) { histCounts(); drawDates(); }
+  }
+
   function stats() {
     var s = document.createElement('pre');
-    s.textContent = H.stats;
+    statsEl = s;
     s.style.cssText = 'position:absolute;left:10px;bottom:10px;z-index:8000;margin:0;padding:8px 12px;'
       + 'background:rgba(13,27,42,.9);border:1px solid #3a5a7a;border-radius:6px;'
       + 'font:12px/1.35 monospace;color:#c8d8e8;pointer-events:none';
@@ -2940,6 +3133,16 @@ _HTML_APP_JS = r"""
     document.body.style.margin = '0';
     document.body.style.background = H.bg;
     document.body.style.overflow = 'hidden';
+    var css = document.createElement('style');
+    css.textContent = '.hm-range{position:absolute;left:0;top:0;width:100%;height:18px;margin:0;'
+      + 'background:none;pointer-events:none;-webkit-appearance:none;appearance:none}'
+      + '.hm-range::-webkit-slider-runnable-track{background:none;height:18px}'
+      + '.hm-range::-moz-range-track{background:none}'
+      + '.hm-range::-webkit-slider-thumb{pointer-events:auto;-webkit-appearance:none;width:10px;'
+      + 'height:16px;margin-top:1px;border-radius:3px;background:#c8d8e8;border:1px solid #4a6a8a;cursor:ew-resize}'
+      + '.hm-range::-moz-range-thumb{pointer-events:auto;width:10px;height:16px;border-radius:3px;'
+      + 'background:#c8d8e8;border:1px solid #4a6a8a;cursor:ew-resize}';
+    document.head.appendChild(css);
     gd.style.position = 'relative';
     gd.appendChild(panel()); gd.appendChild(stats()); gd.appendChild(credit());
     gd.on('plotly_click', function (ev) {

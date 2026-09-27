@@ -278,7 +278,10 @@ A collapsible panel (top left; click **Map options** to fold it away — the pag
 - **Fill** — none, state/country, country, grid4 or grid
 - **Dots & popups** — what one dot and its popup cover: none, state/country, country, grid4 or grid
 - **Layers** — great-circle lines, dot names (state/country dots), country names, state names, state borders, Maidenhead grid fields and squares
-- **QSOs by band** — per-band QSO counts; untick a band to hide its QSOs everywhere (dots, fills, lines and popups), with **all** / **none** shortcuts
+- **Dates** — an activity histogram (QSOs per day, week or month, depending on the log's span) with a two-handle slider that steps by day; only QSOs inside the range are shown, and **all dates** resets it. The page always opens on the full range. QSOs without a date show only while the full range is selected. (`--start` / `--end` still filter the log itself before the map is built.)
+- **QSOs by band** — per-band QSO counts for the selected dates; untick a band to hide its QSOs everywhere (dots, fills, lines, popups and the histogram), with **all** / **none** shortcuts
+
+The band and date filters apply everywhere at once, and the **stats** panel (bottom left) is recomputed live for what is shown.
 
 Colours follow the same rule as image mode ([Map Content](#map-content)): the coarser of the dot and fill units, with neighbours always distinct. Plain `--html` opens with **Fill = state/country** and **Dots = grid4**. The command-line options (`--fill`, `--boxes`, `--names`, `--borders`, `--grid-lines`, `--no-lines`) and a profile chosen by name (`--profile`, or the config file's default) set the panel's **starting state** instead; image-only options (`--width`, `--dpi`, `--font-size`, `--ocean-boxes`, `--box-calls`) are ignored. `--extent poles` trims the starting view; otherwise the whole world is shown — zoom from there.
 
@@ -287,17 +290,16 @@ Colours follow the same rule as image mode ([Map Content](#map-content)): the co
 - **Scroll / pinch** to zoom, **drag** to pan; the toolbar's reset button (top right) resets the view and closes all popups
 - **Hover** a dot for its name and QSO / callsign counts
 - **Click** a dot to **pin a popup**: QSOs in band rows (lowest band first), each with callsign and name, date and QTH. (QSO times are deliberately left out of the HTML, since the file is meant to be shared.) Popups follow the band filter live, scroll when long, stay attached to their dot as you pan and zoom (a thin leader and ring mark the dot), can be **dragged** by their title bar to a different spot relative to the dot, and close with **×** or a second click on the dot. Several can be open at once — handy for annotated screenshots.
-- The **stats** panel (bottom left) matches the image-mode stats box.
 
 ### Shareable views
 
 The page keeps its state in the URL hash, so a view can be bookmarked or shared, e.g.:
 
 ```
-contacts.html#fill=region&dots=region&view=38,-92,3.2&bands=20m,40m&pin=Ohio,Texas
+contacts.html#fill=region&dots=region&view=38,-92,3.2&bands=20m,40m&from=2025-06-01&to=2025-08-31&pin=Ohio,Texas
 ```
 
-Keys: `fill`, `dots` (unit names as above, `region` = state/country), `bands` (comma-separated, only those shown), `view=LAT,LON,ZOOM` (updated as you pan and zoom), `pin` (dot names to open popups for), `panel=0` (start folded), and `lines`, `labels`, `cnames`, `snames`, `borders`, `gfields`, `gsquares` (`1`/`0`).
+Keys: `fill`, `dots` (unit names as above, `region` = state/country), `bands` (comma-separated, only those shown), `from` / `to` (`YYYY-MM-DD`), `view=LAT,LON,ZOOM` (updated as you pan and zoom), `pin` (dot names to open popups for), `panel=0` (start folded), and `lines`, `labels`, `cnames`, `snames`, `borders`, `gfields`, `gsquares` (`1`/`0`).
 
 ## Location Resolution
 
