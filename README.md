@@ -284,7 +284,7 @@ Colours follow the same rule as image mode ([Map Content](#map-content)): the co
 
 ### Navigation and popups
 
-- **Scroll / pinch** to zoom, **drag** to pan, the Plotly toolbar (top right) resets the view
+- **Scroll / pinch** to zoom, **drag** to pan; the toolbar's reset button (top right) resets the view and closes all popups
 - **Hover** a dot for its name and QSO / callsign counts
 - **Click** a dot to **pin a popup**: QSOs in band rows (lowest band first), each with callsign and name, date and QTH. (QSO times are deliberately left out of the HTML, since the file is meant to be shared.) Popups follow the band filter live, scroll when long, stay attached to their dot as you pan and zoom (a thin leader and ring mark the dot), can be **dragged** by their title bar to a different spot relative to the dot, and close with **×** or a second click on the dot. Several can be open at once — handy for annotated screenshots.
 - The **stats** panel (bottom left) matches the image-mode stats box.

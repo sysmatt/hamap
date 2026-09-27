@@ -2951,6 +2951,12 @@ _HTML_APP_JS = r"""
       pin(u, pt.pointNumber, ev.event.clientX - r.left + 14, ev.event.clientY - r.top - 14);
     });
     render();
+    // The toolbar's reset-view button also closes every pinned popup
+    gd.addEventListener('click', function (e) {
+      if (!e.target.closest || !e.target.closest('.modebar-btn[data-attr="reset"]')) return;
+      Object.keys(pinned).forEach(function (k) { pinned[k].el.remove(); delete pinned[k]; });
+      reposition();
+    }, true);
     gd.on('plotly_relayouting', reposition);
     window.addEventListener('resize', function () { setTimeout(reposition, 50); });
     // Remember pan / zoom in the URL so the view can be bookmarked
