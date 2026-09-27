@@ -3341,9 +3341,9 @@ def build_parser():
         '  Units: grid = square as logged, grid4 = 4-char square,\n'
         '         region = US state / Canadian province, else country,\n'
         '         country = country.\n'
-        '  Colour links what belongs together: dots, lines, boxes and fills take\n'
-        '  the colour of the coarser of the --boxes and --fill units, and\n'
-        '  neighbours always get distinct colours.')
+        '  Color shows what belongs together: dots, lines, boxes and shading take\n'
+        '  the color of the larger of the --boxes and --fill units, and\n'
+        '  neighbors always get different colors.')
     content.add_argument('--boxes', choices=('grid', 'grid4', 'region', 'country', 'none'),
                          default='grid',
                          help='What one info box covers (default: grid); none = dots only')
@@ -3351,7 +3351,7 @@ def build_parser():
                          help="Callsigns per info box: 'all' (default), N for the N busiest "
                               'plus a "+k more" footer, 0 for a summary (counts per band)')
     content.add_argument('--band-colors', choices=('on', 'off'), default='on',
-                         help='Colour callsigns in info boxes by band (default: on); '
+                         help='Color callsigns in info boxes by band (default: on); '
                               'the band rows and band key are shown either way')
     content.add_argument('--fill', choices=('none', 'grid', 'grid4', 'region', 'country'),
                          default='none',
