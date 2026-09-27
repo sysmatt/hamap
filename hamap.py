@@ -2557,9 +2557,20 @@ def generate_html_plotly(qsos_with_pos, args, home_pos, out_path, log):
 
     # ── Payload + starting state for the page script ─────────────────────────
     names = args.names
+    # Plain --html opens on state/country fill with grid4 dots; an explicit
+    # --fill / --boxes, or a profile chosen by name (--profile or the config
+    # file's default), sets the starting view instead.
+    src_of  = getattr(args, 'profile_sources', {})
+    chosen  = not getattr(args, 'profile_note', '').startswith('auto')   # not picked by auto
+    def _start(opt, html_default):
+        if src_of.get(opt) == 'command line' or chosen:
+            return getattr(args, opt)
+        return html_default
+    fill0 = _start('fill', 'region')
+    dots0 = _start('boxes', 'grid4')
     start = {
-        'fill':     args.fill,
-        'dots':     args.boxes if args.boxes != 'none' else 'grid',
+        'fill':     fill0,
+        'dots':     dots0 if dots0 != 'none' else 'grid',
         'lines':    bool(home_pos) and not args.no_lines,
         'labels':   True,
         'cnames':   names in ('countries', 'all'),

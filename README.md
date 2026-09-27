@@ -280,7 +280,7 @@ A collapsible panel (top left; click **Map options** to fold it away — the pag
 - **Layers** — great-circle lines, dot names (state/country dots), country names, state names, state borders, Maidenhead grid fields and squares
 - **QSOs by band** — per-band QSO counts; untick a band to hide its QSOs everywhere (dots, fills, lines and popups), with **all** / **none** shortcuts
 
-Colours follow the same rule as image mode ([Map Content](#map-content)): the coarser of the dot and fill units, with neighbours always distinct. The command-line options (`--fill`, `--boxes`, `--names`, `--borders`, `--grid-lines`, `--no-lines`, and so the profiles) only set the panel's **starting state**; image-only options (`--width`, `--dpi`, `--font-size`, `--ocean-boxes`, `--box-calls`) are ignored. `--extent poles` trims the starting view; otherwise the whole world is shown — zoom from there.
+Colours follow the same rule as image mode ([Map Content](#map-content)): the coarser of the dot and fill units, with neighbours always distinct. Plain `--html` opens with **Fill = state/country** and **Dots = grid4**. The command-line options (`--fill`, `--boxes`, `--names`, `--borders`, `--grid-lines`, `--no-lines`) and a profile chosen by name (`--profile`, or the config file's default) set the panel's **starting state** instead; image-only options (`--width`, `--dpi`, `--font-size`, `--ocean-boxes`, `--box-calls`) are ignored. `--extent poles` trims the starting view; otherwise the whole world is shown — zoom from there.
 
 ### Navigation and popups
 
