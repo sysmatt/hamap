@@ -238,13 +238,6 @@ _DXCC_TO_MAPUNIT = {
 }
 
 
-def _dxcc_ncols(n_calls):
-    """Number of columns for condensed callsign layout in DXCC box."""
-    if n_calls <= 6:  return 1
-    if n_calls <= 16: return 2
-    return 3
-
-
 _BAND_ORDER = ['160m', '80m', '60m', '40m', '30m', '20m', '17m', '15m',
                '12m', '10m', '6m', '4m', '2m', '70cm', '23cm']
 
@@ -253,7 +246,7 @@ def _band_sort_key(band):
     try:
         return _BAND_ORDER.index(band)
     except ValueError:
-        return 999
+        return 1000 if band == '?' else 999
 
 
 # --------------------------------------------------------------------------- #
@@ -615,6 +608,20 @@ def maidenhead_to_latlon(grid):
     return (lat, lon)
 
 
+def maidenhead_bounds(grid):
+    """(lon0, lat0, lon1, lat1) of a 4- or 6-char Maidenhead square, or None."""
+    g = (grid or '').upper().strip()
+    if not re.match(r'^[A-R]{2}[0-9]{2}', g):
+        return None
+    lon = (ord(g[0]) - 65) * 20.0 - 180.0 + int(g[2]) * 2.0
+    lat = (ord(g[1]) - 65) * 10.0 - 90.0 + int(g[3]) * 1.0
+    if len(g) >= 6 and 'A' <= g[4] <= 'X' and 'A' <= g[5] <= 'X':
+        lon += (ord(g[4]) - 65) * (2.0 / 24.0)
+        lat += (ord(g[5]) - 65) * (1.0 / 24.0)
+        return lon, lat, lon + 2.0 / 24.0, lat + 1.0 / 24.0
+    return lon, lat, lon + 2.0, lat + 1.0
+
+
 def _country_centroid(name):
     if not name:
         return None
@@ -628,32 +635,48 @@ def _country_centroid(name):
     return None
 
 
+def _parse_adif_coord(s):
+    """
+    ADIF LAT/LON ('XDDD MM.MMM', e.g. N043 31.031 = 43° 31.031′ N) → degrees.
+    Plain decimal degrees are accepted too.  Returns None if unparseable.
+    """
+    s = (s or '').strip().upper()
+    m = re.match(r'^([NSEW])\s*(\d{1,3})\s+(\d{1,2}(?:\.\d+)?)$', s)
+    if m:
+        val = int(m.group(2)) + float(m.group(3)) / 60.0
+        return -val if m.group(1) in 'SW' else val
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
 def resolve_location(qso, log):
-    """Return (lat, lon) for a QSO record, or None if unresolvable."""
-    # 1. Explicit numeric lat/lon fields
-    lat_s = qso.get('LAT', '')
-    lon_s = qso.get('LON', '')
-    if lat_s and lon_s:
-        try:
-            # ADIF LAT/LON use 'N'/'S' and 'E'/'W' prefix: e.g. N043 123.456
-            def _parse_coord(s):
-                s = s.strip()
-                sign = -1 if s and s[0] in ('S', 'W') else 1
-                return sign * float(re.sub(r'^[NSEW]', '', s))
-            return (_parse_coord(lat_s), _parse_coord(lon_s))
-        except ValueError:
-            pass
+    """
+    Return (lat, lon) for a QSO record, or None if unresolvable.  Records
+    where it came from in qso['_LOC_SRC'] ('latlon', 'grid' or 'country'), so
+    callers can tell a real position from a country-centroid stand-in.
+    """
+    # 1. Explicit LAT/LON fields (all-zero values are placeholders)
+    lat = _parse_adif_coord(qso.get('LAT', ''))
+    lon = _parse_adif_coord(qso.get('LON', ''))
+    if lat is not None and lon is not None and (lat, lon) != (0.0, 0.0) \
+            and -90 <= lat <= 90 and -180 <= lon <= 180:
+        qso['_LOC_SRC'] = 'latlon'
+        return (lat, lon)
 
     # 2. Maidenhead grid square
     grid = qso.get('GRIDSQUARE', '')
     if grid:
         pos = maidenhead_to_latlon(grid)
         if pos:
+            qso['_LOC_SRC'] = 'grid'
             return pos
 
     # 3. Country centroid fallback
     centroid = _country_centroid(qso.get('COUNTRY', ''))
     if centroid:
+        qso['_LOC_SRC'] = 'country'
         return centroid
 
     log.trace("No location for %s (grid=%r, country=%r)",
@@ -722,6 +745,9 @@ _BOX_MAX_ROWS = 6          # callsign rows per info box before wrapping to colum
 _COL_GAP    = 1.5          # blank characters between callsign columns
 _BOX_PAD    = 0.45         # info box inner padding, in character heights
 _OCEAN_DETOUR = 2.5        # --ocean-boxes: max open-water distance vs nearest spot
+_OCEAN_MAX_DEG = 8.0       # --ocean-boxes: ...and never further than this from the dot
+_EXTRA_RINGS = 2           # placer: rings searched beyond the first with a free spot
+_CROSS_PENALTY = 2.0       # placer: cost of a leader crossing, in box heights of distance
 
 # Latitude limits for --extent poles (Greenland/Svalbard in, Antarctica out)
 _POLES_LAT  = (-60.0, 84.0)
@@ -734,6 +760,35 @@ def _lighten(hex_color, frac):
     """Blend *hex_color* toward white by *frac* (0..1) — for text on dark fills."""
     r, g, b = (int(hex_color.lstrip('#')[i:i + 2], 16) for i in (0, 2, 4))
     return '#{:02x}{:02x}{:02x}'.format(*(round(c + (255 - c) * frac) for c in (r, g, b)))
+
+
+def _contrast(a, b):
+    """WCAG contrast ratio between two hex colours."""
+    def lum(hx):
+        c = [int(hx.lstrip('#')[i:i + 2], 16) / 255.0 for i in (0, 2, 4)]
+        c = [v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4 for v in c]
+        return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+    hi, lo = sorted((lum(a), lum(b)), reverse=True)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def _text_safe(color, bg=_MAP_BG, target=4.5):
+    """*color* lightened just enough to reach WCAG *target* contrast on *bg*."""
+    frac, out = 0.0, color
+    while _contrast(out, bg) < target and frac < 1.0:
+        frac += 0.02
+        out = _lighten(color, frac)
+    return out
+
+
+# Band colours for callsign text on the dark box fill: 160 m, 12 m and 10 m
+# are lightened to reach 4.5:1; the rest already pass unchanged.
+BAND_TEXT_COLORS  = {b: _text_safe(c) for b, c in BAND_COLORS.items()}
+UNKNOWN_TEXT_CLR  = _text_safe(UNKNOWN_COLOR)
+
+
+def band_text_color(band):
+    return BAND_TEXT_COLORS.get(band, UNKNOWN_TEXT_CLR)
 
 
 def compute_extent(points, args):
@@ -796,92 +851,6 @@ def figure_height_for(extent, width):
 # Grouping contacts by grid square / location
 # --------------------------------------------------------------------------- #
 
-def group_by_grid(qsos_with_pos, truncate=False):
-    """
-    Group QSOs by GRIDSQUARE (normalised to uppercase, optionally truncated to 4 chars).
-    Contacts without a grid fall back to country name, then rounded lat/lon.
-
-    Returns a dict:
-        key → {
-            'dot_lat': float, 'dot_lon': float,
-            'qsos':    [qso, ...],
-            'label_header': str,   # first line of the annotation box
-            'color':   str,        # hex colour for dot + line + box
-        }
-    """
-    groups = {}
-
-    for qso, (lat, lon) in qsos_with_pos:
-        grid = qso.get('GRIDSQUARE', '').upper().strip()
-        if grid:
-            if truncate:
-                grid = grid[:4]
-            key = grid
-            label_header = grid
-        else:
-            country = qso.get('COUNTRY', '').strip()
-            if country:
-                key = f'_CTY_{country}'
-                label_header = country[:14]
-            else:
-                key = f'_POS_{lat:.0f}_{lon:.0f}'
-                label_header = (f"{abs(lat):.0f}°{'N' if lat >= 0 else 'S'} "
-                                f"{abs(lon):.0f}°{'E' if lon >= 0 else 'W'}")
-
-        if key not in groups:
-            groups[key] = {
-                'dot_lat':      lat,
-                'dot_lon':      lon,
-                'qsos':         [],
-                'label_header': label_header,
-            }
-        groups[key]['qsos'].append(qso)
-
-    # Assign one colour per group based on the most common band
-    for info in groups.values():
-        band_counts = Counter(qso.get('BAND', 'unknown').lower()
-                              for qso in info['qsos'])
-        top_band = band_counts.most_common(1)[0][0]
-        info['color'] = BAND_COLORS.get(top_band, UNKNOWN_COLOR)
-
-    return groups
-
-
-def group_by_dxcc(qsos_with_pos, log):
-    """
-    Group QSOs by DXCC entity (DXCC field, falling back to COUNTRY name).
-    One group per entity; dot positioned at the entity centroid.
-
-    Returns the same dict shape as group_by_grid().
-    """
-    groups = {}
-    for qso, (lat, lon) in qsos_with_pos:
-        dxcc_num = qso.get('DXCC', '').strip()
-        country  = qso.get('COUNTRY', '').strip()
-        key      = dxcc_num if dxcc_num else (f'_CTY_{country}' if country else
-                                              f'_POS_{lat:.0f}_{lon:.0f}')
-        if key not in groups:
-            centroid = _country_centroid(country)
-            groups[key] = {
-                'dot_lat':      centroid[0] if centroid else lat,
-                'dot_lon':      centroid[1] if centroid else lon,
-                'qsos':         [],
-                'label_header': (country[:16] if country else dxcc_num or '?'),
-                'country':      country,
-                'dxcc_num':     dxcc_num,
-            }
-        groups[key]['qsos'].append(qso)
-
-    for info in groups.values():
-        band_counts = Counter(qso.get('BAND', 'unknown').lower()
-                              for qso in info['qsos'])
-        top_band = band_counts.most_common(1)[0][0]
-        info['color'] = BAND_COLORS.get(top_band, UNKNOWN_COLOR)
-
-    log.verbose("DXCC mode: %d entities from %d QSOs", len(groups), len(qsos_with_pos))
-    return groups
-
-
 def _country_areas(log):
     """{lower(country name): area in deg²} from Natural Earth, for label priority."""
     import cartopy.io.shapereader as shpreader
@@ -919,9 +888,9 @@ def _ne_norm(s):
     return ' '.join(words)
 
 
-def load_dxcc_geometries(groups, log):
+def load_country_geometries(countries, log):
     """
-    Return {country_name: shapely_geometry} for each entity in *groups*.
+    Return {country_name: shapely_geometry} for each ADIF COUNTRY name given.
 
     Matching pipeline (first hit wins):
       1. Explicit remap via _DXCC_TO_MAPUNIT
@@ -952,7 +921,7 @@ def load_dxcc_geometries(groups, log):
     # ── Primary: admin_0_map_units at 10m ────────────────────────────────────
     # At 10m, small territories (Guernsey, Isle of Man, Anguilla, …) are present
     # as separate polygons that are absent from the coarser 110m file.
-    log.verbose("DXCC fill: loading admin_0_map_units (10m)...")
+    log.verbose("Country shapes: loading admin_0_map_units (10m)...")
     shp0 = shpreader.natural_earth(
         resolution='10m', category='cultural', name='admin_0_map_units')
     # Specific unit names first, broad ones (sovereign / admin country) second,
@@ -971,7 +940,7 @@ def load_dxcc_geometries(groups, log):
     # ── Secondary: admin_1_states_provinces at 10m ───────────────────────────
     # Needed for sub-national DXCC entities: Alaska, Hawaii, Sardinia (Sardegna
     # / name_en=Sardinia), Crete (Kriti / name_en=Crete), Balearic Islands, …
-    log.verbose("DXCC fill: loading admin_1_states_provinces (10m)...")
+    log.verbose("Country shapes: loading admin_1_states_provinces (10m)...")
     shp1 = shpreader.natural_earth(
         resolution='10m', category='cultural', name='admin_1_states_provinces')
     for rec in shpreader.Reader(shp1).records():
@@ -980,8 +949,7 @@ def load_dxcc_geometries(groups, log):
             _add(a.get(f, ''), rec.geometry)
 
     geometries = {}
-    for info in groups.values():
-        country = info.get('country', '')
+    for country in countries:
         if not country:
             continue
 
@@ -1006,16 +974,16 @@ def load_dxcc_geometries(groups, log):
             hits = difflib.get_close_matches(q, ne_norm_keys_a0, n=1, cutoff=0.80)
             if hits:
                 geom = ne_norm[hits[0]]
-                log.debug("DXCC fill: fuzzy-matched %r → %r", country, hits[0])
+                log.debug("Country shapes: fuzzy-matched %r → %r", country, hits[0])
 
         if geom:
             geometries[country] = geom
         else:
-            log.debug("DXCC fill: no shapefile match for %r (tried %r)",
+            log.debug("Country shapes: no match for %r (tried %r)",
                       country, target)
 
-    log.verbose("DXCC fill: matched %d of %d entities to polygons",
-                len(geometries), sum(1 for i in groups.values() if i.get('country')))
+    log.verbose("Country shapes: matched %d of %d countries",
+                len(geometries), sum(1 for c in countries if c))
     return geometries
 
 
@@ -1062,10 +1030,10 @@ def place_labels(groups, args, log, ax, pre_placed=None, land_prep=None):
     pre_placed: optional list of [cx, cy, hw, hh, key] obstacles already on the
                 map (e.g. country/state text labels) that callsign boxes must avoid.
     land_prep:  optional shapely PreparedGeometry of the world land polygons.
-                When provided (--dxcc, --ocean-boxes) the placer first looks for
-                a spot where the whole box is over open water — within
-                --ocean-reach degrees of the dot (unlimited in DXCC mode) —
-                before falling back to the nearest collision-free spot.
+                When provided (--ocean-boxes) the placer also looks for a spot
+                where the whole box is over open water, and takes it unless it
+                is more than _OCEAN_DETOUR times as far as the nearest spot
+                (and never more than _OCEAN_MAX_DEG from the dot).
 
     Returns (positions, boxes_px) where:
         positions = {key: (label_lat, label_lon)}   — box centres in data coords
@@ -1078,36 +1046,22 @@ def place_labels(groups, args, log, ax, pre_placed=None, land_prep=None):
 
     # ── Per-group helpers ────────────────────────────────────────────────────
     def _box_px(info):
-        """Return (w_px, h_px) matching the new split rendering layout."""
+        """(w_px, h_px) of the box as drawn: header, rule, band rows, footer."""
         char_h  = font_pt * dpi / 72.0
         char_w  = char_h * 0.62
         leading = char_h * 1.2
         pad     = char_h * _BOX_PAD
-        calls   = info['body']
-        more    = info.get('more')
-        # top pad + header + small sep zone + call lines + bottom pad
-        if 'ncols' in info and calls:
-            ncols  = info['ncols']
-            nrows  = math.ceil(len(calls) / ncols)
-            max_cw = max(len(c) for c in calls)
-            hdr_w  = len(info['label_header']) * char_w + 2 * pad
-            w_px   = max(hdr_w, ncols * (max_cw + _COL_GAP) * char_w - _COL_GAP * char_w + 2 * pad)
-            h_px   = pad + char_h + pad * 0.5 + 1.0 + nrows * leading + pad
-        else:
-            max_ch = max(len(l) for l in [info['label_header']] + (calls or ['']))
-            h_px   = pad + char_h + pad * 0.5 + 1.0 + len(calls) * leading + pad
-            w_px   = max_ch * char_w + 2 * pad
-        if more:
+        width, lines, _, _ = box_metrics(info)
+        w_px = width * char_w + 2 * pad
+        h_px = pad + char_h + pad * 0.5 + 1.0 + lines * leading + pad
+        if info.get('more'):
             h_px += leading
-            w_px  = max(w_px, len(more) * char_w + 2 * pad)
         return w_px, h_px
 
     dot_r_px = math.sqrt(_DOT_SIZE / math.pi) * (dpi / 72.0) + 2.0
+    # --ocean-boxes never sends a box further than _OCEAN_MAX_DEG out to sea
+    ocean_cap_px = _OCEAN_MAX_DEG * (ll_to_px(1.0, 0.0)[0] - ll_to_px(0.0, 0.0)[0])
     from shapely.geometry import box as _sbox
-    # Ocean pass reach, px: unlimited in DXCC mode, else --ocean-reach degrees
-    px_per_deg = ll_to_px(1.0, 0.0)[0] - ll_to_px(0.0, 0.0)[0]
-    ocean_px   = (math.inf if getattr(args, 'dxcc', False)
-                  else getattr(args, 'ocean_reach', 8.0) * px_per_deg)
     gap_px   = max(4.0, font_pt * dpi / 72.0 * 0.6)
 
     dot_obs = {k: ll_to_px(info['dot_lon'], info['dot_lat'])
@@ -1141,6 +1095,47 @@ def place_labels(groups, args, log, ax, pre_placed=None, land_prep=None):
         _index(entry)
     for k, (dx, dy) in dot_obs.items():
         _index([dx, dy, dot_r_px, dot_r_px, k])
+
+    # ── Leader lines (dot → box centre) in their own cell index ─────────────
+    leaders = {}                      # key → (x0, y0, x1, y1)
+    lgrid   = defaultdict(set)
+
+    def _lcells(seg):
+        x0, y0, x1, y1 = seg
+        return [(i, j) for i in range(int(min(x0, x1) // cell_px), int(max(x0, x1) // cell_px) + 1)
+                for j in range(int(min(y0, y1) // cell_px), int(max(y0, y1) // cell_px) + 1)]
+
+    def _lset(key, cx, cy):
+        _lclear(key)
+        seg = (*dot_obs[key], cx, cy)
+        leaders[key] = seg
+        for c in _lcells(seg):
+            lgrid[c].add(key)
+
+    def _lclear(key):
+        seg = leaders.pop(key, None)
+        if seg:
+            for c in _lcells(seg):
+                lgrid[c].discard(key)
+
+    def _cross(p, q):
+        """True if segments p and q properly intersect (shared ends don't count)."""
+        def orient(ax_, ay_, bx_, by_, cx_, cy_):
+            v = (bx_ - ax_) * (cy_ - ay_) - (by_ - ay_) * (cx_ - ax_)
+            return int(v > 1e-9) - int(v < -1e-9)
+        a, b = (p[0], p[1]), (p[2], p[3])
+        c, d = (q[0], q[1]), (q[2], q[3])
+        return (orient(*a, *b, *c) * orient(*a, *b, *d) < 0 and
+                orient(*c, *d, *a) * orient(*c, *d, *b) < 0)
+
+    def _crossings(seg, skip=()):
+        """Keys of placed leaders that *seg* crosses."""
+        near = set()
+        for c in _lcells(seg):
+            near |= lgrid.get(c, set())
+        # sorted: set order varies between runs (string hashing), and the
+        # swap pass must visit crossings in the same order every time
+        return sorted(k for k in near if k not in skip and _cross(seg, leaders[k]))
 
     def _in_bounds(cx, cy, hw, hh, margin=4.0):
         return (cx - hw >= ax_x0 + margin and
@@ -1179,14 +1174,23 @@ def place_labels(groups, args, log, ax, pre_placed=None, land_prep=None):
             ty = (hh + clear) / abs(s) if abs(s) > 1e-6 else math.inf
             rays.append((c, s, min(tx, ty)))
 
-        def _sweep(ocean_only=False):
-            limit = min(max_extra, ocean_px) if ocean_only else max_extra
-            extra = 0.0
+        def _sweep(ocean_only=False, max_dist=None):
+            """
+            Free spots from the first ring that has any plus the next
+            _EXTRA_RINGS rings; the winner is the nearest after a penalty for
+            each existing leader line its own leader would cross (a slight
+            bias keeps the preferred-direction order for ties).  Spots
+            further than *max_dist* from the dot are not considered.
+            """
+            limit = max_extra if max_dist is None else min(max_extra, max_dist)
+            extra, first, found = 0.0, None, []
             while extra <= limit:
-                for c, s, t0 in rays:
+                for n, (c, s, t0) in enumerate(rays):
                     cx = dx + (t0 + extra) * c
                     cy = dy + (t0 + extra) * s
                     if not _in_bounds(cx, cy, hw, hh):
+                        continue
+                    if max_dist is not None and math.hypot(cx - dx, cy - dy) > max_dist:
                         continue
                     if _collides(cx, cy, hw, hh, skip_key=skip_key):
                         continue
@@ -1195,25 +1199,30 @@ def place_labels(groups, args, log, ax, pre_placed=None, land_prep=None):
                         tlat, tlon = px_to_ll(cx + hw, cy + hh)
                         if land_prep.intersects(_sbox(blon, blat, tlon, tlat)):
                             continue   # touches land — skip during ocean pass
-                    return cx, cy, hw, hh
+                    found.append((cx, cy, n))
+                if found and first is None:
+                    first = extra
+                if first is not None and extra >= first + _EXTRA_RINGS * step:
+                    break
                 extra += step
-            return None
+            if not found:
+                return None
+            pen = _CROSS_PENALTY * step
+            cx, cy, _ = min(found, key=lambda f: (
+                math.hypot(f[0] - dx, f[1] - dy)
+                + pen * len(_crossings((dx, dy, f[0], f[1]), skip=(skip_key,)))
+                + 0.5 * f[2]))
+            return cx, cy, hw, hh
 
+        best = _sweep(ocean_only=False)
         if land_prep is None:
-            return _sweep(ocean_only=False)
-        ocean = _sweep(ocean_only=True)
-        if getattr(args, 'dxcc', False):
-            return ocean or _sweep(ocean_only=False)   # DXCC: ocean whenever possible
+            return best
         # --ocean-boxes: take open water only when it isn't a big detour over
         # the nearest spot of any kind, so boxes with room beside their dot
         # stay there and only crowded ones head offshore.
-        best = _sweep(ocean_only=False)
-        if ocean and best:
-            d_ocean = math.hypot(ocean[0] - dx, ocean[1] - dy)
-            d_best  = math.hypot(best[0] - dx, best[1] - dy)
-            if d_ocean <= d_best * _OCEAN_DETOUR:
-                return ocean
-        return best or ocean
+        reach = ocean_cap_px if best is None else min(
+            ocean_cap_px, math.hypot(best[0] - dx, best[1] - dy) * _OCEAN_DETOUR)
+        return _sweep(ocean_only=True, max_dist=reach) or best
 
     # Crowded areas first: they have the fewest good spots, so let them claim
     # those before sparse neighbours spill in. Ties → busier groups first.
@@ -1244,6 +1253,7 @@ def place_labels(groups, args, log, ax, pre_placed=None, land_prep=None):
             log.debug("Label placement fallback for %s", key)
         boxes[key] = [cx, cy, hw, hh, key]
         _index(boxes[key])
+        _lset(key, cx, cy)
         positions[key] = px_to_ll(cx, cy)
 
     # Pass 2: boxes placed early may now find nothing better, but boxes that
@@ -1258,15 +1268,64 @@ def place_labels(groups, args, log, ax, pre_placed=None, land_prep=None):
         if cur_dist <= (entry[2] + entry[3] + dot_r_px + gap_px) * 1.5:
             continue
         _unindex(entry)
+        _lclear(key)
         result = _try_place(groups[key], skip_key=key)
         if result and math.hypot(result[0] - dx, result[1] - dy) < cur_dist * 0.80:
             entry[:4] = result
             positions[key] = px_to_ll(result[0], result[1])
             improved += 1
         _index(entry)
+        _lset(key, entry[0], entry[1])
 
     if improved:
         log.verbose("  Moved %d label(s) closer to their dots.", improved)
+
+    def _n_crossings():
+        return sum(len(_crossings(leaders[k], skip=(k,))) for k in leaders) // 2
+
+    # Pass 3: two crossing leaders always get shorter in total when their
+    # boxes trade places (triangle inequality), so swap wherever both boxes
+    # still fit and no more crossings are created than removed.
+    before, swaps = _n_crossings(), 0
+    for _ in range(6):
+        changed = False
+        for a in list(boxes):
+            for b in _crossings(leaders[a], skip=(a,)):
+                if b not in boxes or a == b:
+                    continue
+                ea, eb = boxes[a], boxes[b]
+                pa, pb = (ea[0], ea[1]), (eb[0], eb[1])
+                old_len = (math.dist(dot_obs[a], pa) + math.dist(dot_obs[b], pb))
+                new_len = (math.dist(dot_obs[a], pb) + math.dist(dot_obs[b], pa))
+                if new_len >= old_len:
+                    continue
+                _unindex(ea); _unindex(eb)
+                ok = (_in_bounds(pb[0], pb[1], ea[2], ea[3]) and
+                      _in_bounds(pa[0], pa[1], eb[2], eb[3]) and
+                      not _collides(pb[0], pb[1], ea[2], ea[3], skip_key=a) and
+                      not _collides(pa[0], pa[1], eb[2], eb[3], skip_key=b) and
+                      not (abs(pb[0] - pa[0]) < ea[2] + eb[2] + gap_px and
+                           abs(pb[1] - pa[1]) < ea[3] + eb[3] + gap_px))
+                if ok:
+                    old_x = (len(_crossings(leaders[a], skip=(a, b))) +
+                             len(_crossings(leaders[b], skip=(a, b))) + 1)
+                    na, nb = (*dot_obs[a], *pb), (*dot_obs[b], *pa)
+                    new_x = (len(_crossings(na, skip=(a, b))) +
+                             len(_crossings(nb, skip=(a, b))) + int(_cross(na, nb)))
+                    ok = new_x < old_x
+                if ok:
+                    ea[0], ea[1], eb[0], eb[1] = pb[0], pb[1], pa[0], pa[1]
+                    positions[a] = px_to_ll(*pb)
+                    positions[b] = px_to_ll(*pa)
+                    _lset(a, *pb); _lset(b, *pa)
+                    swaps += 1
+                    changed = True
+                _index(ea); _index(eb)
+                if ok:
+                    break
+        if not changed:
+            break
+    log.verbose("  Leader crossings: %d → %d after %d swap(s)", before, _n_crossings(), swaps)
 
     placed.extend(boxes.values())
     boxes_px = {key: (cx, cy, hw, hh)
@@ -1285,32 +1344,72 @@ def place_labels(groups, args, log, ax, pre_placed=None, land_prep=None):
 # Map figure assembly
 # --------------------------------------------------------------------------- #
 
-def _box_body(info, box_calls):
-    """
-    Lines listed under an info box header.
+def _qso_band(qso):
+    return qso.get('BAND', '').strip().lower() or '?'
 
-    box_calls None → every callsign; 0 → a summary (calls, grids, per-band
-    QSO counts); N → the N busiest callsigns, with info['more'] set to a
-    "+k more" footer line.
+
+def box_sections(info, box_calls):
     """
-    qsos  = info['qsos']
-    calls = sorted({q.get('CALL', '') for q in qsos})
-    if box_calls is None or 0 < len(calls) <= box_calls:
-        return calls
+    Info box body as band rows: [(label, band, items), ...], lowest band
+    first, '?' (no BAND) last.  A station worked on several bands appears in
+    each of their rows.  Sets info['more'] to a "+k more" footer when capped.
+
+    box_calls None → every callsign; N → the N busiest callsigns;
+    0 → a summary: calls and grids (unlabelled), then QSOs per band.
+    """
+    qsos     = info['qsos']
+    per_call = Counter(q.get('CALL', '') for q in qsos)
+    calls    = sorted(per_call)
     if box_calls == 0:
         n_grids = len({q.get('GRIDSQUARE', '').upper()[:4] for q in qsos
                        if q.get('GRIDSQUARE')})
-        bands = Counter(q.get('BAND', '?').lower() for q in qsos)
-        parts = [f"{b}:{n}" for b, n in sorted(bands.items(),
-                                               key=lambda kv: _band_sort_key(kv[0]))]
-        lines = [f"{len(calls)} call{'s' if len(calls) != 1 else ''}"]
+        head = [f"{len(calls)} call{'s' if len(calls) != 1 else ''}"]
         if n_grids:
-            lines.append(f"{n_grids} grid{'s' if n_grids != 1 else ''}")
-        return lines + [' '.join(parts[i:i + 2]) for i in range(0, len(parts), 2)]
-    per_call = Counter(q.get('CALL', '') for q in qsos)
-    busiest  = sorted(calls, key=lambda c: (-per_call[c], c))[:box_calls]
-    info['more'] = f"+{len(calls) - box_calls} more"
-    return sorted(busiest)
+            head.append(f"{n_grids} grid{'s' if n_grids != 1 else ''}")
+        per_band = Counter(_qso_band(q) for q in qsos)
+        return [(None, None, head)] + [
+            (b, b, [f"{n} QSO{'s' if n != 1 else ''}"])
+            for b, n in sorted(per_band.items(), key=lambda kv: _band_sort_key(kv[0]))]
+    shown = calls
+    if box_calls is not None and len(calls) > box_calls:
+        shown = sorted(sorted(calls, key=lambda c: (-per_call[c], c))[:box_calls])
+        info['more'] = f"+{len(calls) - box_calls} more"
+    shown = set(shown)
+    by_band = defaultdict(set)
+    for q in qsos:
+        if q.get('CALL', '') in shown:
+            by_band[_qso_band(q)].add(q.get('CALL', ''))
+    return [(b, b, sorted(by_band[b])) for b in sorted(by_band, key=_band_sort_key)]
+
+
+def box_columns(sections, area_box, summary):
+    """Callsign columns for a box: region boxes aim for ~2.5:1 lines:columns,
+    grid boxes wrap once they pass _BOX_MAX_ROWS lines."""
+    n = sum(len(items) for _, _, items in sections)
+    if summary or n <= 1:
+        return 1
+    if area_box:
+        return max(1, round(math.sqrt(n / 2.5)))
+    ncols = 1
+    while (sum(math.ceil(len(items) / ncols) for _, _, items in sections) > _BOX_MAX_ROWS
+           and ncols < n):
+        ncols += 1
+    return ncols
+
+
+def box_metrics(info):
+    """
+    Layout of an info box in characters: (width, content lines, band-label
+    column width, item width).  Shared by the placer and the renderer.
+    """
+    secs, ncols = info['sections'], info['ncols']
+    lab    = max((len(l) for l, _, _ in secs if l), default=0)
+    lab_w  = lab + 1 if lab else 0
+    item_w = max((len(i) for _, _, items in secs for i in items), default=0)
+    body_w = lab_w + ncols * item_w + (ncols - 1) * _COL_GAP if item_w else 0
+    lines  = sum(max(1, math.ceil(len(items) / ncols)) for _, _, items in secs)
+    width  = max(len(info['label_header']), body_w, len(info.get('more') or ''))
+    return width, lines, lab_w, item_w
 
 
 _US_NAMES = {'united states', 'united states of america', 'usa'}
@@ -1337,87 +1436,166 @@ def _region_anchor(geom, pts):
     return c.y, c.x
 
 
-def group_by_entity(qsos_with_pos, args, log):
+# Map units, fine → coarse.  Boxes (--boxes), fills (--fill) and colours all
+# pick one of these; colour always follows the coarser of the box and fill units.
+UNITS      = ('grid', 'grid4', 'region', 'country')
+_UNIT_RANK = {u: i for i, u in enumerate(UNITS)}
+_AREA_UNITS = ('region', 'country')
+
+
+class _StateLookup:
     """
-    Group QSOs by geographic entity: US state / Canadian province, otherwise
-    country.  State comes from the ADIF STATE field when valid, else from a
-    point-in-polygon test against Natural Earth admin-1 shapes (Canada logs
-    rarely carry STATE).
-
-    Each entity gets a single dot at its region's centroid (info['geom'] holds
-    the region shape for tinting).  Countries with no Natural Earth match fall
-    back to the mean position of their contacts, untinted.
+    US state / Canadian province for a QSO: the ADIF STATE field when valid,
+    else a point-in-polygon test against Natural Earth admin-1 shapes (Canadian
+    logs rarely carry STATE), else the nearest state/province within ~2° (grid
+    centres often land in a lake or offshore).
     """
-    import cartopy.io.shapereader as shpreader
-    from shapely.geometry import Point
-    from shapely.prepared import prep
 
-    shp = shpreader.natural_earth(
-        resolution='10m', category='cultural', name='admin_1_states_provinces')
-    admin1 = [(r.attributes['adm0_a3'], (r.attributes.get('postal') or '').upper(),
-               r.attributes.get('name') or '', r.geometry)
-              for r in shpreader.Reader(shp).records()
-              if r.attributes.get('adm0_a3') in ('USA', 'CAN')]
-    us_postal = {p: name for adm, p, name, _ in admin1 if adm == 'USA'}
-    geom_of   = {f'{adm}-{p}': g for adm, p, name, g in admin1}
-    prepared  = [(adm, p, name, g.bounds, prep(g)) for adm, p, name, g in admin1]
+    def __init__(self):
+        import cartopy.io.shapereader as shpreader
+        from shapely.prepared import prep
+        shp = shpreader.natural_earth(
+            resolution='10m', category='cultural', name='admin_1_states_provinces')
+        self.admin1 = [(r.attributes['adm0_a3'], (r.attributes.get('postal') or '').upper(),
+                        r.attributes.get('name') or '', r.geometry)
+                       for r in shpreader.Reader(shp).records()
+                       if r.attributes.get('adm0_a3') in ('USA', 'CAN')]
+        self.us_postal = {p: name for adm, p, name, _ in self.admin1 if adm == 'USA'}
+        self.geom_of   = {f'{adm}-{p}': g for adm, p, name, g in self.admin1}
+        self.prepared  = [(adm, p, name, g.bounds, prep(g)) for adm, p, name, g in self.admin1]
 
-    def _pip(lat, lon, adm_want):
+    def _pip(self, lat, lon, adm_want):
+        from shapely.geometry import Point
         pt = Point(lon, lat)
-        for adm, p, name, (x0, y0, x1, y1), pg in prepared:
+        for adm, p, name, (x0, y0, x1, y1), pg in self.prepared:
             # Same-country only: border states' polygons include lake halves
             if (adm == adm_want and x0 <= lon <= x1 and y0 <= lat <= y1
                     and pg.contains(pt)):
-                return adm, p, name
-        # Grid centres often land offshore or in a lake: take the nearest
-        # state/province of the right country within ~2°.
-        near = [(g.distance(pt), adm, p, name) for adm, p, name, g in admin1
-                if adm == adm_want]
-        d, adm, p, name = min(near)
-        return (adm, p, name) if d < 2.0 else None
+                return p, name
+        d, p, name = min((g.distance(pt), p, name)
+                         for adm, p, name, g in self.admin1 if adm == adm_want)
+        return (p, name) if d < 2.0 else None
 
-    groups = {}
-    for qso, (lat, lon) in qsos_with_pos:
-        country = qso.get('COUNTRY', '').strip()
-        cl      = country.lower()
-        key     = None
-        if cl in _US_NAMES or cl == 'canada':
-            adm = 'USA' if cl in _US_NAMES else 'CAN'
-            st  = qso.get('STATE', '').strip().upper()
-            if adm == 'USA' and st in us_postal:
-                key, header = f'USA-{st}', us_postal[st]
-            else:
-                hit = _pip(lat, lon, adm)
-                if hit and hit[0] == adm:
-                    key, header = f'{adm}-{hit[1]}', hit[2]
-        if key is None:
-            key    = f'_CTY_{country}' if country else f'_POS_{lat:.0f}_{lon:.0f}'
-            header = country or f"{lat:.0f},{lon:.0f}"
-        if key not in groups:
-            groups[key] = {'qsos': [], 'pts': [], 'label_header': header[:18]}
-            if key in geom_of:
-                groups[key]['geom'] = geom_of[key]
-            elif country:
-                groups[key]['country'] = country     # geometry looked up below
-        groups[key]['qsos'].append(qso)
-        groups[key]['pts'].append((lat, lon))
-
-    country_geoms = load_dxcc_geometries(groups, log)
-    for info in groups.values():
-        pts  = info.pop('pts')
-        geom = info.get('geom') or country_geoms.get(info.get('country', ''))
-        if geom is not None:
-            info['geom'] = geom
-            info['dot_lat'], info['dot_lon'] = _region_anchor(geom, pts)
+    def state_of(self, qso, lat, lon):
+        """(key, name, geometry) for US/CA QSOs, else None."""
+        cl = qso.get('COUNTRY', '').strip().lower()
+        if cl in _US_NAMES:
+            adm = 'USA'
+        elif cl == 'canada':
+            adm = 'CAN'
         else:
-            info['dot_lat'] = sum(p[0] for p in pts) / len(pts)
-            info['dot_lon'] = sum(p[1] for p in pts) / len(pts)
-        top = Counter(q.get('BAND', 'unknown').lower() for q in info['qsos'])
-        info['color'] = BAND_COLORS.get(top.most_common(1)[0][0], UNKNOWN_COLOR)
+            return None
+        st = qso.get('STATE', '').strip().upper()
+        if adm == 'USA' and st in self.us_postal:
+            hit = (st, self.us_postal[st])
+        elif qso.get('_LOC_SRC') in ('latlon', 'grid'):
+            hit = self._pip(lat, lon, adm)
+        else:
+            return None     # position is only the country centroid — no state
+        if not hit:
+            return None
+        key = f'{adm}-{hit[0]}'
+        return key, hit[1], self.geom_of[key]
 
-    log.verbose("Entity mode: %d entities (%d states/provinces) from %d QSOs",
-                len(groups), sum(k[:4] in ('USA-', 'CAN-') for k in groups),
-                len(qsos_with_pos))
+
+class UnitIndex:
+    """
+    Each located QSO's key in every map unit, plus unit labels and shapes.
+
+      grid     the square as logged (usually 6 characters)
+      grid4    the 4-character square
+      region   US state / Canadian province, otherwise country
+      country  the ADIF COUNTRY entity (Alaska, Hawaii, ... are their own)
+
+    QSOs without a grid fall back to their country (or rounded position) in the
+    grid units.  Region/country shapes come from Natural Earth and are loaded
+    only when *shapes* is true; grid shapes are computed from the locator.
+    """
+
+    def __init__(self, qsos_with_pos, shapes, log):
+        from shapely.geometry import box as _sbox
+        self.qsos  = qsos_with_pos
+        self.keys  = []
+        self.label = {u: {} for u in UNITS}
+        self.geom  = {u: {} for u in UNITS}
+        states     = _StateLookup() if shapes else None
+        countries  = set()
+
+        for qso, (lat, lon) in qsos_with_pos:
+            grid    = qso.get('GRIDSQUARE', '').upper().strip()
+            country = qso.get('COUNTRY', '').strip()
+            if country:
+                fb_key, fb_label = f'C:{country}', country
+            else:
+                fb_key   = f'_POS_{lat:.0f}_{lon:.0f}'
+                fb_label = (f"{abs(lat):.0f}°{'N' if lat >= 0 else 'S'} "
+                            f"{abs(lon):.0f}°{'E' if lon >= 0 else 'W'}")
+            countries.add(country)
+            k = {}
+            for unit, g in (('grid', grid), ('grid4', grid[:4])):
+                if g:
+                    k[unit] = g
+                    self.label[unit][g] = g
+                    if g not in self.geom[unit]:
+                        b = maidenhead_bounds(g)
+                        self.geom[unit][g] = _sbox(*b) if b else None
+                else:
+                    k[unit] = fb_key
+                    self.label[unit][fb_key] = fb_label[:14]
+                    self.geom[unit].setdefault(fb_key, None)
+            k['country'] = fb_key
+            self.label['country'][fb_key] = fb_label[:18]
+            st = states.state_of(qso, lat, lon) if states else None
+            if st:
+                k['region'] = st[0]
+                self.label['region'][st[0]] = st[1][:18]
+                self.geom['region'][st[0]] = st[2]
+            else:
+                k['region'] = fb_key
+                self.label['region'][fb_key] = fb_label[:18]
+            self.keys.append(k)
+
+        if shapes:
+            cg = load_country_geometries(sorted(c for c in countries if c), log)
+            for c, g in cg.items():
+                self.geom['country'][f'C:{c}'] = g
+            for key in self.label['region']:
+                if key not in self.geom['region']:
+                    # US/Canada are split into states: a QSO with no known
+                    # state must not tint the whole country
+                    split = key[2:].lower() in _US_NAMES or key == 'C:Canada'
+                    self.geom['region'][key] = (None if split
+                                                else self.geom['country'].get(key))
+
+    def majority(self, idx, unit):
+        """Most common *unit* key among the QSOs at positions *idx*."""
+        return Counter(self.keys[i][unit] for i in idx).most_common(1)[0][0]
+
+
+def build_groups(index, unit):
+    """
+    One group (info box / dot / line) per *unit* key.  Grid groups sit at their
+    first QSO's position; region/country groups at the centroid of the area
+    actually worked (see _region_anchor).
+    """
+    groups = {}
+    for i, (qso, pos) in enumerate(index.qsos):
+        k = index.keys[i][unit]
+        g = groups.setdefault(k, {'qsos': [], 'pts': [], 'idx': [],
+                                  'label_header': index.label[unit][k]})
+        g['qsos'].append(qso)
+        g['pts'].append(pos)
+        g['idx'].append(i)
+    for k, g in groups.items():
+        geom = index.geom[unit].get(k)
+        if unit in _AREA_UNITS and geom is not None:
+            g['geom'] = geom
+            g['dot_lat'], g['dot_lon'] = _region_anchor(geom, g['pts'])
+        elif unit in _AREA_UNITS:
+            g['dot_lat'] = sum(p[0] for p in g['pts']) / len(g['pts'])
+            g['dot_lon'] = sum(p[1] for p in g['pts']) / len(g['pts'])
+        else:
+            g['dot_lat'], g['dot_lon'] = g['pts'][0]
     return groups
 
 
@@ -1431,7 +1609,7 @@ def group_by_entity(qsos_with_pos, args, log):
 REGION_PALETTE = ['#3987e5', '#d95926', '#199e70', '#c98500',
                   '#d55181', '#2f9a2f', '#9085e9', '#89939e']
 _REGION_NEAR_DEG  = 1.5     # regions this close (shapes) count as neighbours
-_POINT_NEAR_DEG   = 2.5     # ... for regions without a shape (grid mode)
+_POINT_NEAR_DEG   = 2.5     # ... for keys without a shape (no grid / unmatched)
 _BOX_NEAR_CHARS   = 5.0     # boxes / dots this close (in char heights) too
 _REGION_GOOD_DE   = 15.0    # neighbour colour separation (ΔE) that is 'enough'
 
@@ -1472,22 +1650,28 @@ def _palette_distances(palette):
              for j in range(n)] for i in range(n)]
 
 
-def assign_region_colors(groups, boxes_px, ll_to_px, char_px, log):
+def assign_colors(index, cu, groups, boxes_px, ll_to_px, char_px, log):
     """
-    Recolour groups so that neighbouring regions look clearly different.
+    Colour every *cu*-unit key (state, country or grid square) so neighbours
+    look clearly different; returns {key: colour}.  Each group gets info['ck'],
+    the cu key most of its QSOs fall in (a grid box takes its state's colour).
 
-    Neighbours are regions whose shapes (or dots, without a shape) lie within a
-    small distance, plus any whose boxes or dots end up close on the page after
-    placement — ocean-placed boxes can sit together although their regions
-    don't touch.  Colouring is DSatur-style (most-constrained region first);
-    each region takes the palette colour most distinct from its coloured
-    neighbours (anything ≥ _REGION_GOOD_DE counts as distinct enough), ties
-    going to the least-used colour to keep the map balanced.
+    Neighbours are keys whose shapes lie close (regions within
+    _REGION_NEAR_DEG; grid squares that touch, corners included), plus keys
+    whose boxes or dots end up close on the page after placement — ocean-
+    placed boxes can sit together although their regions don't touch.
+    Colouring is DSatur-style (most-constrained key first); each key takes the
+    palette colour most distinct from its coloured neighbours (anything
+    ≥ _REGION_GOOD_DE counts as distinct enough), ties going to the least-used
+    colour to keep the map balanced.
     """
     from shapely.geometry import Point
     from shapely.strtree import STRtree
 
-    keys = sorted(groups)
+    for info in groups.values():
+        info['ck'] = index.majority(info['idx'], cu)
+
+    keys = sorted({k[cu] for k in index.keys})
     idx  = {k: i for i, k in enumerate(keys)}
     adj  = {k: set() for k in keys}
 
@@ -1497,45 +1681,49 @@ def assign_region_colors(groups, boxes_px, ll_to_px, char_px, log):
             adj[b].add(a)
 
     # 1. geographic neighbours
-    for near, subset in ((_REGION_NEAR_DEG, [k for k in keys if groups[k].get('geom') is not None]),
-                         (_POINT_NEAR_DEG,  [k for k in keys if groups[k].get('geom') is None])):
-        if not subset:
-            continue
-        shapes = [groups[k]['geom'].simplify(0.05) if groups[k].get('geom') is not None
-                  else Point(groups[k]['dot_lon'], groups[k]['dot_lat']) for k in subset]
-        tree = STRtree(shapes)
-        for i, j in zip(*tree.query(shapes, predicate='dwithin', distance=near)):
-            _link(subset[i], subset[j])
-    # regions with a shape vs dot-only regions (e.g. an unmatched country)
-    shaped = [k for k in keys if groups[k].get('geom') is not None]
+    grid_unit = cu not in _AREA_UNITS
+    shaped    = [k for k in keys if index.geom[cu].get(k) is not None]
     if shaped:
-        tree = STRtree([groups[k]['geom'].simplify(0.05) for k in shaped])
-        for k in keys:
-            if groups[k].get('geom') is None:
-                pt = Point(groups[k]['dot_lon'], groups[k]['dot_lat'])
-                for j in tree.query(pt, predicate='dwithin', distance=_REGION_NEAR_DEG):
-                    _link(k, shaped[j])
+        shapes = [index.geom[cu][k] if grid_unit else index.geom[cu][k].simplify(0.05)
+                  for k in shaped]
+        tree = STRtree(shapes)
+        near = 0.01 if grid_unit else _REGION_NEAR_DEG
+        for i, j in zip(*tree.query(shapes, predicate='dwithin', distance=near)):
+            _link(shaped[i], shaped[j])
+    # keys without a shape (no grid / unmatched country): mean QSO position
+    pos = defaultdict(list)
+    for i, k in enumerate(index.keys):
+        pos[k[cu]].append(index.qsos[i][1])
+    loose = [k for k in keys if index.geom[cu].get(k) is None]
+    if loose:
+        pts  = [Point(sum(p[1] for p in pos[k]) / len(pos[k]),
+                      sum(p[0] for p in pos[k]) / len(pos[k])) for k in loose]
+        everything = [index.geom[cu][k] for k in shaped] + pts
+        tree = STRtree(everything)
+        allk = shaped + loose
+        for i, j in zip(*tree.query(pts, predicate='dwithin', distance=_POINT_NEAR_DEG)):
+            _link(loose[i], allk[j])
 
-    # 2. neighbours on the page: boxes near boxes, dots near other regions' boxes
+    # 2. neighbours on the page: boxes near boxes, dots near other boxes
     near_px = _BOX_NEAR_CHARS * char_px
-    dots = {k: ll_to_px(groups[k]['dot_lon'], groups[k]['dot_lat']) for k in keys}
-    bk   = [k for k in keys if k in boxes_px]
+    dots = {g: ll_to_px(info['dot_lon'], info['dot_lat']) for g, info in groups.items()}
+    bk   = [g for g in groups if g in boxes_px]
     for i, a in enumerate(bk):
         ax_, ay_, ahw, ahh = boxes_px[a]
         for b in bk[i + 1:]:
             bx_, by_, bhw, bhh = boxes_px[b]
             if (abs(ax_ - bx_) < ahw + bhw + near_px and
                     abs(ay_ - by_) < ahh + bhh + near_px):
-                _link(a, b)
-        for k, (dx, dy) in dots.items():
+                _link(groups[a]['ck'], groups[b]['ck'])
+        for g, (dx, dy) in dots.items():
             if abs(dx - ax_) < ahw + near_px and abs(dy - ay_) < ahh + near_px:
-                _link(a, k)
+                _link(groups[a]['ck'], groups[g]['ck'])
 
     # 3. palette-aware DSatur colouring
-    dist   = _palette_distances(REGION_PALETTE)
-    ncol   = len(REGION_PALETTE)
-    color  = {}
-    used   = [0] * ncol
+    dist    = _palette_distances(REGION_PALETTE)
+    ncol    = len(REGION_PALETTE)
+    color   = {}
+    used    = [0] * ncol
     pending = set(keys)
     while pending:
         k = max(pending, key=lambda v: (len({color[n] for n in adj[v] if n in color}),
@@ -1554,21 +1742,20 @@ def assign_region_colors(groups, boxes_px, ll_to_px, char_px, log):
     clashes = sum(1 for k in keys for n in adj[k] if color[n] == color[k]) // 2
     weak = sum(1 for k in keys for n in adj[k]
                if dist[color[k]][color[n]] < _REGION_GOOD_DE) // 2
-    log.verbose("Region colours: %d regions, %d neighbour links (max %d per region); "
+    log.verbose("Colours by %s: %d keys, %d neighbour links (max %d per key); "
                 "same colour: %d, weakly separated (ΔE < %.0f): %d",
-                len(keys), sum(len(v) for v in adj.values()) // 2,
+                cu, len(keys), sum(len(v) for v in adj.values()) // 2,
                 max((len(v) for v in adj.values()), default=0), clashes,
                 _REGION_GOOD_DE, weak)
     log.verbose("  colour use: %s", ' '.join(f"{REGION_PALETTE[c]}:{used[c]}" for c in range(ncol)))
-    for k in keys:
-        groups[k]['color'] = REGION_PALETTE[color[k]]
+    return {k: REGION_PALETTE[color[k]] for k in keys}
 
 
-def _summary_text(qsos_with_pos, args):
+def _summary_text(qsos_with_pos, args, index=None):
     """Multi-line text for the statistics box (station, counts, dates, filters)."""
     total       = len(qsos_with_pos)
     unique_cs   = len({qso.get('CALL', '')     for qso, _ in qsos_with_pos})
-    glen        = 4 if args.truncate_grids else None
+    glen        = None if args.boxes == 'grid' else 4
     unique_grid = len({qso.get('GRIDSQUARE', '').upper().strip()[:glen]
                        for qso, _ in qsos_with_pos
                        if qso.get('GRIDSQUARE', '').strip()})
@@ -1585,6 +1772,22 @@ def _summary_text(qsos_with_pos, args):
             ('Grids:', f"{unique_grid:,}"),
             ('Callsigns:', f"{unique_cs:,}"),
             ('Countries:', f"{countries:,}")]
+    # Worked US states / Canadian provinces (WAS / RAC): from the region lookup
+    # when shapes were loaded, else from the ADIF STATE field
+    if index is not None and index.geom['region']:
+        regions = {k['region'] for k in index.keys}
+        n_us = sum(r.startswith('USA-') for r in regions)
+        n_ca = sum(r.startswith('CAN-') for r in regions)
+    else:
+        def _st(names):
+            return len({q.get('STATE', '').strip().upper() for q, _ in qsos_with_pos
+                        if q.get('COUNTRY', '').strip().lower() in names
+                        and q.get('STATE', '').strip()})
+        n_us, n_ca = _st(_US_NAMES), _st({'canada'})
+    if n_us:
+        rows.append(('US states:', f"{n_us}"))
+    if n_ca:
+        rows.append(('CA provinces:', f"{n_ca}"))
     if dates:
         rows += [None, ('First QSO:', _fmt_date(dates[0])),
                  ('Last QSO:', _fmt_date(dates[-1]))]
@@ -1609,6 +1812,42 @@ def _summary_text(qsos_with_pos, args):
                   for r in rows]
 
     return '\n'.join(all_lines)
+
+
+_GRIDLINE_CLR = '#4a6a8a'   # Maidenhead overlay lines / field labels
+
+
+def draw_grid_lines(ax, proj, extent, level, geo_scale):
+    """
+    Maidenhead overlay within *extent*: 'fields' draws the 20° × 10° field
+    lines with their two-letter labels; 'squares' adds faint 2° × 1° lines.
+    """
+    lon0, lon1, lat0, lat1 = extent
+
+    def _lines(dlon, dlat, lw, alpha):
+        x = math.ceil(lon0 / dlon) * dlon
+        while x <= lon1:
+            ax.plot([x, x], [lat0, lat1], transform=proj, color=_GRIDLINE_CLR,
+                    linewidth=lw, alpha=alpha, zorder=2.6)
+            x += dlon
+        y = math.ceil(lat0 / dlat) * dlat
+        while y <= lat1:
+            ax.plot([lon0, lon1], [y, y], transform=proj, color=_GRIDLINE_CLR,
+                    linewidth=lw, alpha=alpha, zorder=2.6)
+            y += dlat
+
+    if level == 'squares':
+        _lines(2.0, 1.0, 0.15, 0.35)
+    _lines(20.0, 10.0, 0.5, 0.7)
+    for fi in range(18):
+        for fj in range(18):
+            clon = -180.0 + fi * 20.0 + 10.0
+            clat = -90.0 + fj * 10.0 + 5.0
+            if lon0 < clon < lon1 and lat0 < clat < lat1:
+                ax.text(clon, clat, chr(65 + fi) + chr(65 + fj), transform=proj,
+                        fontsize=18 * geo_scale, color=_GRIDLINE_CLR, alpha=0.55,
+                        fontweight='bold', ha='center', va='center',
+                        fontfamily='monospace', zorder=2.7)
 
 
 def generate_map(qsos_with_pos, home_pos, args, log):
@@ -1642,8 +1881,8 @@ def generate_map(qsos_with_pos, home_pos, args, log):
         'cultural', 'admin_0_countries', '10m', facecolor='none',
         edgecolor=_BORDER_CLR, linewidth=0.20))
 
-    if args.label_states:
-        # Only the countries whose subdivisions we label (US states, CA provinces)
+    if args.borders == 'states':
+        # US states and Canadian provinces (the regions --boxes/--fill region use)
         import cartopy.io.shapereader as shpreader
         shp1 = shpreader.natural_earth(
             resolution='10m', category='cultural', name='admin_1_states_provinces')
@@ -1658,65 +1897,36 @@ def generate_map(qsos_with_pos, home_pos, args, log):
     gl.xlocator = mticker.MultipleLocator(30)
     gl.ylocator = mticker.MultipleLocator(30)
 
-    # ---- Group contacts by grid square / DXCC entity --------------------
-    log.verbose("Grouping contacts...")
-    entity_mode = args.group_by == 'entity' and not getattr(args, 'dxcc', False)
-    if getattr(args, 'dxcc', False):
-        groups = group_by_dxcc(qsos_with_pos, log)
-    elif entity_mode:
-        groups = group_by_entity(qsos_with_pos, args, log)
-    else:
-        groups = group_by_grid(qsos_with_pos, truncate=args.truncate_grids)
-    log.verbose("  %d unique groups from %d QSOs", len(groups), len(qsos_with_pos))
+    # Geographic label fonts scale with canvas width so they stay proportionally
+    # readable at any size, independent of the box --font-size setting.
+    _geo_scale = args.width / 48.0   # 1.0 at 48 in
+    lon0, lon1, lat0, lat1 = extent
 
-    # Box contents, then wrap long lists into columns so boxes stay compact.
-    # Entity boxes (dozens of calls) aim for roughly 2.5:1 rows:cols.
+    # ---- Maidenhead overlay (--grid-lines) -------------------------------
+    if args.grid_lines != 'none':
+        draw_grid_lines(ax, proj, extent, args.grid_lines, _geo_scale)
+
+    # ---- Group contacts into boxes; index every QSO by map unit ----------
+    show_boxes  = args.boxes != 'none'
+    group_unit  = args.boxes if show_boxes else 'grid'     # dots / lines per grid
+    fill_unit   = None if args.fill == 'none' else args.fill
+    color_unit  = max([group_unit] + ([fill_unit] if fill_unit else []),
+                      key=lambda u: _UNIT_RANK[u])
+    need_shapes = any(u in _AREA_UNITS for u in (group_unit, fill_unit, color_unit))
+    log.verbose("Grouping contacts (boxes: %s, fill: %s, colour by: %s)...",
+                args.boxes, args.fill, color_unit)
+    index  = UnitIndex(qsos_with_pos, need_shapes, log)
+    groups = build_groups(index, group_unit)
+    log.verbose("  %d groups from %d QSOs", len(groups), len(qsos_with_pos))
+
+    # Box contents as band rows, wrapped into columns so boxes stay compact
     for info in groups.values():
-        info['body'] = _box_body(info, args.box_calls)
-        n = len(info['body'])
-        if getattr(args, 'dxcc', False) or args.box_calls == 0 or n <= _BOX_MAX_ROWS:
-            continue
-        info['ncols'] = (max(1, round(math.sqrt(n / 2.5))) if entity_mode
-                         else math.ceil(n / _BOX_MAX_ROWS))
+        info['sections'] = box_sections(info, args.box_calls)
+        info['ncols']    = box_columns(info['sections'], group_unit in _AREA_UNITS,
+                                       args.box_calls == 0)
 
-    # ll_to_px / px_to_ll needed for both DXCC column sizing and label obstacles
+    # ll_to_px / px_to_ll needed for label obstacles and box geometry
     ll_to_px, px_to_ll, ax_x0, ax_y0, ax_w_px, ax_h_px = _ax_pixel_fns(ax, args)
-
-    # ---- DXCC entity flood fill (below dots/labels, above land) ----------
-    if getattr(args, 'dxcc', False):
-        dxcc_geometries = load_dxcc_geometries(groups, log)
-        _ch  = args.font_size * args.dpi / 72.0   # char height in px (for col sizing)
-        _cw  = _ch * 0.62                          # char width in px
-        for info in groups.values():
-            geom = dxcc_geometries.get(info.get('country', ''))
-            if geom:
-                ax.add_geometries(
-                    [geom], crs=ccrs.PlateCarree(),
-                    facecolor=info['color'], edgecolor=info['color'],
-                    linewidth=0.5, alpha=0.30, zorder=4,
-                )
-                # Compute ncols from entity pixel width so the box
-                # scales with the size of the entity on the map.
-                calls_ = info['body']
-                if calls_:
-                    max_cw_   = max(len(c) for c in calls_)
-                    col_w_px  = (max_cw_ + _COL_GAP) * _cw   # width of one column
-                    minx, _, maxx, _ = geom.bounds
-                    px_l, _ = ll_to_px(max(minx, -179.9), 0)
-                    px_r, _ = ll_to_px(min(maxx,  179.9), 0)
-                    entity_w = max(0.0, px_r - px_l)
-                    # Fill ~50% of the entity width; cap at 10 cols, ensure ≥2 rows
-                    ncols = max(1, min(len(calls_), 10,
-                                      int(entity_w * 0.50 / col_w_px)))
-                    ncols = min(ncols, math.ceil(len(calls_) / 2))
-                    info['ncols'] = max(1, ncols)
-                else:
-                    info['ncols'] = 1
-        # Fallback for entities with no matched geometry
-        for info in groups.values():
-            if 'ncols' not in info:
-                calls_ = info['body']
-                info['ncols'] = _dxcc_ncols(len(calls_))
 
     # ---- Fixed text labels (countries / states) — drawn first, act as obstacles
     pre_placed = []
@@ -1731,14 +1941,8 @@ def generate_map(qsos_with_pos, home_pos, args, log):
         hh = ch * 1.35 / 2 + pad * 0.5
         return [cx, cy, hw, hh, f'_LBL_{name}']
 
-    # Geographic label fonts scale with canvas width so they stay proportionally
-    # readable at any size, independent of the box --font-size setting.
-    # Anchored so the formula reproduces the old values at the legacy 24-inch width.
-    _geo_scale = args.width / 48.0   # 0.5 at 24 in, 1.0 at 48 in default
     cfont = max(2.0, 5.1 * _geo_scale)
     sfont = max(1.8, 4.5 * _geo_scale)
-
-    lon0, lon1, lat0, lat1 = extent
 
     def _place_geo_label(name, lat, lon, fpt, color, alpha):
         """Draw a geographic label unless it is off-map or overlaps one already drawn."""
@@ -1755,13 +1959,14 @@ def generate_map(qsos_with_pos, home_pos, args, log):
         return True
 
     # States first (more specific), then countries largest-first, so crowded
-    # regions keep the most useful names and drop micro-states.
-    if args.label_states and not entity_mode:
+    # regions keep the most useful names and drop micro-states.  Region boxes
+    # already name their state, so state labels are skipped then.
+    if args.names in ('states', 'all') and group_unit != 'region':
         log.verbose("Drawing state/province labels...")
         for state, (slat, slon) in STATE_CENTROIDS.items():
             _place_geo_label(state, slat, slon, sfont, '#8899aa', 0.55)
 
-    if args.label_countries:
+    if args.names in ('countries', 'all'):
         log.verbose("Drawing country labels...")
         areas = _country_areas(log)
         order = sorted(COUNTRY_CENTROIDS.items(),
@@ -1772,9 +1977,9 @@ def generate_map(qsos_with_pos, home_pos, args, log):
                       for c, (clat, clon) in order)
         log.verbose("  %d country labels skipped (off-map or overlapping)", dropped)
 
-    # ---- Land mask for ocean-preferring placement (--dxcc, --ocean-boxes) --
+    # ---- Land mask for ocean-preferring placement (--ocean-boxes) --------
     _land_prep = None
-    if (getattr(args, 'dxcc', False) or args.ocean_boxes) and not args.no_labels:
+    if args.ocean_boxes and show_boxes:
         try:
             import cartopy.io.shapereader as shpreader
             from shapely.ops import unary_union
@@ -1788,23 +1993,22 @@ def generate_map(qsos_with_pos, home_pos, args, log):
             log.debug("Land geometry unavailable, ocean preference disabled: %s", exc)
 
     # ---- Corner overlays (stats box, band legend) as placement obstacles --
-    summary_text  = _summary_text(qsos_with_pos, args)
-    present_bands = sorted(
-        {qso.get('BAND', 'unknown').lower()
-         for info in groups.values() for qso in info['qsos']},
-        key=_band_sort_key,
-    )
+    summary_text  = _summary_text(qsos_with_pos, args, index)
     _pt = args.dpi / 72.0
     s_lines = summary_text.split('\n')
     s_fpt   = 14 * _geo_scale
     s_w = (max(len(l) for l in s_lines) * 0.62 + 1.4) * s_fpt * _pt
     s_h = (len(s_lines) * 1.2 + 1.4) * s_fpt * _pt
     sizes = {'stats': (s_w, s_h)}
-    if present_bands and args.color_by == 'band':
+    # Band key: QSOs per band, swatches in the callsign text colours
+    band_qsos   = Counter(_qso_band(q) for q, _ in qsos_with_pos)
+    band_labels = {b: f"{b:<5}{band_qsos[b]:>7,}" for b in band_qsos}
+    present_bands = sorted(band_qsos, key=_band_sort_key)
+    if present_bands:
         l_fpt  = 16 * _geo_scale
         l_cols = max(1, len(present_bands) // 8)
-        l_rows = math.ceil(len(present_bands) / l_cols)
-        l_w = l_cols * (4.0 + max(len(b) for b in present_bands) * 0.62) * l_fpt * _pt
+        l_rows = math.ceil(len(present_bands) / l_cols) + 1          # + title
+        l_w = l_cols * (4.0 + max(len(v) for v in band_labels.values()) * 0.62) * l_fpt * _pt
         l_h = (l_rows * 1.3 + 1.5) * l_fpt * _pt
         sizes['legend'] = (l_w, l_h)
 
@@ -1844,7 +2048,7 @@ def generate_map(qsos_with_pos, home_pos, args, log):
         pre_placed.append([hx, hy, star_r, star_r, '_HOME'])
 
     # ---- Compute label positions -----------------------------------------
-    if not args.no_labels:
+    if show_boxes:
         log.verbose("Computing label positions...")
         label_pos, boxes_px = place_labels(groups, args, log, ax,
                                            pre_placed=pre_placed,
@@ -1852,21 +2056,32 @@ def generate_map(qsos_with_pos, home_pos, args, log):
     else:
         label_pos, boxes_px = {}, {}
 
-    # ---- Region colouring: neighbours get clearly different colours -------
-    if args.color_by == 'region':
-        assign_region_colors(groups, boxes_px, ll_to_px,
-                             args.font_size * args.dpi / 72.0, log)
+    # ---- Colours: by the coarser of the box and fill units ---------------
+    colors = assign_colors(index, color_unit, groups, boxes_px, ll_to_px,
+                           args.font_size * args.dpi / 72.0, log)
+    for info in groups.values():
+        info['color'] = colors[info['ck']]
 
-    # ---- Entity region tint: ties each region to its single dot and box ----
-    if entity_mode:
+    # ---- Fill worked regions / grid squares (--fill) ---------------------
+    if fill_unit:
         from matplotlib.colors import to_rgba
-        for info in groups.values():
-            if info.get('geom') is not None:
-                ax.add_geometries(
-                    [info['geom']], crs=proj,
-                    facecolor=to_rgba(info['color'], 0.16),
-                    edgecolor=to_rgba(info['color'], 0.45),
-                    linewidth=0.4, zorder=2.5)
+        members = defaultdict(list)
+        for i, k in enumerate(index.keys):
+            members[k[fill_unit]].append(i)
+        grid_fill = fill_unit not in _AREA_UNITS
+        n_filled = 0
+        for fk, idx in members.items():
+            geom = index.geom[fill_unit].get(fk)
+            if geom is None:
+                continue
+            c = colors[index.majority(idx, color_unit)]
+            ax.add_geometries(
+                [geom], crs=proj,
+                facecolor=to_rgba(c, 0.30 if grid_fill else 0.16),
+                edgecolor=to_rgba(c, 0.60 if grid_fill else 0.45),
+                linewidth=0.3 if grid_fill else 0.4, zorder=2.5)
+            n_filled += 1
+        log.verbose("Filled %d %s shapes", n_filled, fill_unit)
 
     # ---- Great-circle lines (one arc per unique dot) ---------------------
     if home_pos and not args.no_lines:
@@ -1880,7 +2095,7 @@ def generate_map(qsos_with_pos, home_pos, args, log):
         l_width = args.line_width if args.line_width is not None else max(0.4, 0.8 * density)
         log.verbose("Drawing %d great-circle lines (alpha %.2f, width %.2f)...",
                     n_lines, l_alpha, l_width)
-        # Most common colour first, so rarer bands draw on top of it
+        # Most common colour first, so rarer ones draw on top of it
         color_freq = Counter(d[2] for d in line_dots)
         for d_lat, d_lon, d_color in sorted(line_dots, key=lambda d: -color_freq[d[2]]):
             for seg_lons, seg_lats in _great_circle_segments(
@@ -1892,7 +2107,7 @@ def generate_map(qsos_with_pos, home_pos, args, log):
                 )
 
     # ---- Leader lines (dot → label box) ----------------------------------
-    if not args.no_labels:
+    if show_boxes:
         for key, info in groups.items():
             if key not in label_pos:
                 continue
@@ -1918,7 +2133,7 @@ def generate_map(qsos_with_pos, home_pos, args, log):
         )
 
     # ---- Label boxes (drawn on top of leader line ends) ------------------
-    if not args.no_labels:
+    if show_boxes:
         log.verbose("Drawing %d label boxes...", len(label_pos))
         char_h  = args.font_size * args.dpi / 72.0
         leading = char_h * 1.2
@@ -1930,7 +2145,6 @@ def generate_map(qsos_with_pos, home_pos, args, log):
             lbl_lat, lbl_lon = label_pos[key]
             cx, cy, hw, hh   = boxes_px[key]
             color = info['color']
-            calls = info['body']
 
             # Background + border rectangle
             top_lat,  left_lon  = px_to_ll(cx - hw, cy + hh)
@@ -1965,36 +2179,34 @@ def generate_map(qsos_with_pos, home_pos, args, log):
                     linewidth=0.5, alpha=0.85,
                     solid_capstyle='butt', zorder=9)
 
-            # Callsign text block
-            if calls:
-                if 'ncols' in info:
-                    ncols       = info['ncols']
-                    nrows       = math.ceil(len(calls) / ncols)
-                    max_cw      = max(len(c) for c in calls)
-                    col_w_px    = (max_cw + _COL_GAP) * char_h * 0.62
-                    center_y    = sep_y_px - pad_px * 0.25 - nrows * leading / 2
-                    anchor_lat, _ = px_to_ll(cx, center_y)
-                    for ci in range(ncols):
-                        col_calls = calls[ci * nrows:(ci + 1) * nrows]
-                        if not col_calls:
-                            continue
-                        col_x_px = cx - (ncols - 1) * col_w_px / 2 + ci * col_w_px
-                        _, col_lon = px_to_ll(col_x_px, center_y)
-                        # Pad short columns so every column top-aligns
-                        col_calls = col_calls + [' '] * (nrows - len(col_calls))
-                        ax.text(col_lon, anchor_lat, '\n'.join(col_calls),
-                                transform=proj,
-                                fontsize=args.font_size, color=_CALL_CLR,
-                                va='center', ha='center',
-                                fontfamily='monospace', zorder=9)
-                else:
-                    calls_center_y = sep_y_px - pad_px * 0.25 - len(calls) * leading / 2
-                    calls_lat, _   = px_to_ll(cx, calls_center_y)
-                    ax.text(lbl_lon, calls_lat, '\n'.join(calls),
-                            transform=proj,
-                            fontsize=args.font_size, color=_CALL_CLR,
-                            va='center', ha='center',
-                            fontfamily='monospace', zorder=9)
+            # Band rows: label column, then callsigns in columns, in band colour
+            _, _, lab_w, item_w = box_metrics(info)
+            char_w = char_h * 0.62
+            ncols  = info['ncols']
+            x_lab  = cx - hw + pad_px
+            x_body = x_lab + lab_w * char_w
+            top    = sep_y_px - pad_px * 0.25
+            for label, band, items in info['sections']:
+                nl  = max(1, math.ceil(len(items) / ncols))
+                clr = (band_text_color(band) if band and args.band_colors == 'on'
+                       else _CALL_CLR)
+                if label:
+                    lab_lat, lab_lon = px_to_ll(x_lab, top - leading / 2)
+                    ax.text(lab_lon, lab_lat, label, transform=proj,
+                            fontsize=args.font_size, color=clr, fontweight='bold',
+                            va='center', ha='left', fontfamily='monospace', zorder=9)
+                col_lat, _ = px_to_ll(cx, top - nl * leading / 2)
+                x0 = x_body if label else x_lab           # unlabelled rows: no indent
+                for ci in range(ncols):
+                    col = items[ci * nl:(ci + 1) * nl]
+                    if not col:
+                        continue
+                    col = col + [' '] * (nl - len(col))   # keep columns top-aligned
+                    _, col_lon = px_to_ll(x0 + ci * (item_w + _COL_GAP) * char_w, 0)
+                    ax.text(col_lon, col_lat, '\n'.join(col), transform=proj,
+                            fontsize=args.font_size, color=clr,
+                            va='center', ha='left', fontfamily='monospace', zorder=9)
+                top -= nl * leading
 
             # "+k more" footer when the callsign list was capped
             if info.get('more'):
@@ -2016,18 +2228,22 @@ def generate_map(qsos_with_pos, home_pos, args, log):
 
     # ---- Band legend -----------------------------------------------------
     legend_patches = [
-        mpatches.Patch(color=BAND_COLORS.get(b, UNKNOWN_COLOR), label=b)
+        mpatches.Patch(color=(band_text_color(b) if args.band_colors == 'on'
+                              else _CALL_CLR), label=band_labels[b])
         for b in present_bands
-    ] if args.color_by == 'band' else []
+    ]
     if legend_patches:
         leg = ax.legend(
             handles=legend_patches,
-            loc=overlay_corner['legend'], fontsize=16 * _geo_scale,
+            loc=overlay_corner['legend'],
+            prop={'family': 'monospace', 'size': 16 * _geo_scale},
+            title='QSOs by band', title_fontsize=16 * _geo_scale,
             borderaxespad=corner_m / (16 * _geo_scale * _pt),
-            framealpha=0.85, facecolor=_MAP_BG,
-            edgecolor='#3a5a7a', labelcolor='white',
+            framealpha=0.90, facecolor=_MAP_BG,
+            edgecolor='#3a5a7a', labelcolor='#c8d8e8',
             ncol=max(1, len(legend_patches) // 8), borderpad=0.5,
         )
+        leg.get_title().set_color('#c8d8e8')
         leg.set_zorder(20)
 
     # ---- Summary statistics box (lower-left, axes-relative) -------------
@@ -2111,323 +2327,571 @@ def _great_circle_segments(lat1, lon1, lat2, lon2):
     return segs
 
 
-def generate_html_plotly(groups, args, home_pos, out_path, log):
+def _geojson_features(geoms, simplify):
+    """
+    GeoJSON features {id: str(i)} for [(i, shapely_geom)], simplified and with
+    clockwise exterior rings (what d3-geo, and so Plotly, expects for fills).
+    Coordinates rounded to 3 decimals to keep the HTML small.
+    """
+    from shapely.geometry import mapping, Polygon, MultiPolygon
+    from shapely.geometry.polygon import orient
+
+    def _round(c):
+        if isinstance(c, (list, tuple)):
+            if c and isinstance(c[0], (int, float)):
+                return [round(c[0], 3), round(c[1], 3)]
+            return [_round(x) for x in c]
+        return c
+
+    feats = []
+    for i, g in geoms:
+        if simplify:
+            g = g.simplify(simplify, preserve_topology=True)
+        polys = [p for p in getattr(g, 'geoms', [g]) if isinstance(p, Polygon) and not p.is_empty]
+        if not polys:
+            continue
+        g = MultiPolygon([orient(p, sign=-1.0) for p in polys])
+        m = mapping(g)
+        feats.append({'type': 'Feature', 'id': str(i), 'properties': {},
+                      'geometry': {'type': m['type'], 'coordinates': _round(m['coordinates'])}})
+    return feats
+
+
+def generate_html_plotly(qsos_with_pos, args, home_pos, out_path, log):
     """
     Write a fully self-contained interactive HTML map using Plotly.
-    Zoomable, pannable, with hover popups per contact group.
-    Great-circle lines are true geodesics interpolated with _great_circle_path.
+
+    Every map unit (grid, grid4, region, country) is pre-computed — its dots,
+    fill shapes and neighbour-aware colours — and a collapsible panel in the
+    page switches between them live: what the dots/popups cover, what is
+    filled, which bands are shown, and the reference layers.  The command-line
+    options only set the panel's starting state (also settable in the URL
+    hash, e.g. map.html#fill=grid4&dots=region&bands=20m,40m&pin=Ohio).
     """
+    import json
     try:
         import plotly.graph_objects as go
     except ImportError:
         log.error("plotly is required for --html.  Install: pip install plotly")
         return
 
-    # ── Great-circle lines, one aggregated trace per band ────────────────────
-    line_traces = []
-    if home_pos and not args.no_lines:
-        home_lat, home_lon = home_pos
-        by_band_lines = defaultdict(lambda: {'lats': [], 'lons': []})
-        for info in groups.values():
-            band = Counter(qso.get('BAND', '?').lower()
-                           for qso in info['qsos']).most_common(1)[0][0]
-            gc_lats, gc_lons = _great_circle_path(
-                home_lat, home_lon, info['dot_lat'], info['dot_lon'])
-            by_band_lines[band]['lats'].extend(gc_lats + [None])
-            by_band_lines[band]['lons'].extend(gc_lons + [None])
+    # ── Pre-compute every unit: groups, colours, coarser-unit majorities ──────
+    log.verbose("HTML: indexing QSOs by grid, grid4, region and country...")
+    index = UnitIndex(qsos_with_pos, True, log)
+    units = {}
+    for u in UNITS:
+        groups = build_groups(index, u)
+        keys   = list(groups)
+        pos    = {k: i for i, k in enumerate(keys)}
+        colors = assign_colors(index, u, groups, {}, lambda lon, lat: (lon, lat), 1.0, log)
+        units[u] = {'keys': keys, 'pos': pos, 'groups': groups, 'colors': colors}
+    pal_idx = {c: i for i, c in enumerate(REGION_PALETTE)}
 
-        for band in sorted(by_band_lines, key=_band_sort_key):
-            d = by_band_lines[band]
-            line_traces.append(go.Scattergeo(
-                lat=d['lats'], lon=d['lons'],
-                mode='lines',
-                line=dict(width=0.6, color=BAND_COLORS.get(band, UNKNOWN_COLOR)),
-                opacity=0.18,
-                showlegend=False,
-                hoverinfo='skip',
-            ))
+    payload_units = {}
+    for u in UNITS:
+        U = units[u]
+        gl = [U['groups'][k] for k in U['keys']]
+        maj = {}
+        for v in UNITS:
+            if _UNIT_RANK[v] > _UNIT_RANK[u]:
+                maj[v] = [units[v]['pos'][index.majority(g['idx'], v)] for g in gl]
+        payload_units[u] = {
+            'label': [g['label_header'] for g in gl],
+            'lat':   [round(g['dot_lat'], 4) for g in gl],
+            'lon':   [round(g['dot_lon'], 4) for g in gl],
+            'q':     [g['idx'] for g in gl],
+            'color': [pal_idx[U['colors'][k]] for k in U['keys']],
+            'maj':   maj,
+        }
 
-    # ── Contact dots, one trace per band (drives the legend) ─────────────────
-    by_band_dots = defaultdict(lambda: {'lats': [], 'lons': [], 'hovers': []})
-    for info in groups.values():
-        band_counts = Counter(qso.get('BAND', '?').lower() for qso in info['qsos'])
-        top_band    = band_counts.most_common(1)[0][0]
+    def _qrow(q):
+        t = q.get('TIME_ON', '')
+        return [q.get('CALL', ''), _qso_band(q), q.get('NAME', '').strip(),
+                _fmt_date(q.get('QSO_DATE', '')),
+                f"{t[:2]}:{t[2:4]}Z" if len(t) >= 4 else '',
+                (q.get('QTH', '') or q.get('CITY', '')).strip()]
+    qrows = [_qrow(q) for q, _ in qsos_with_pos]
 
-        bands_str = ' · '.join(
-            f"{b}×{n}" if n > 1 else b
-            for b, n in sorted(band_counts.items(),
-                               key=lambda kv: _band_sort_key(kv[0]))
-        )
-        dates = sorted({qso.get('QSO_DATE', '') for qso in info['qsos']
-                        if qso.get('QSO_DATE')})
-        date_str = (f"{_fmt_date(dates[0])} – {_fmt_date(dates[-1])}"
-                    if len(dates) > 1 else _fmt_date(dates[0]) if dates else '')
-        countries = sorted({qso.get('COUNTRY', '') for qso in info['qsos']
-                            if qso.get('COUNTRY')})
+    band_qsos = Counter(r[1] for r in qrows)
+    bands = sorted(band_qsos, key=_band_sort_key)
+    band_clr = {b: (band_text_color(b) if args.band_colors == 'on' else _CALL_CLR)
+                for b in bands}
 
-        n_qso = len(info['qsos'])
-        hover = (
-            f"<b style='color:{info['color']}'>{info['label_header']}</b>"
-            f"&nbsp;&nbsp;<span style='color:#8899aa'>"
-            f"{n_qso} QSO{'s' if n_qso != 1 else ''}</span><br>"
-        )
-        if bands_str:
-            hover += f"<span style='color:#8899aa'>Band: {bands_str}</span><br>"
-        if date_str:
-            hover += f"<span style='color:#8899aa'>{date_str}</span><br>"
-        if countries:
-            hover += f"<span style='color:#8899aa'>{', '.join(countries[:3])}</span><br>"
+    # ── Traces.  JS fills in colours, visibility and lines; T maps roles → index
+    traces, T = [], {'fill': {}, 'dots': {}, 'labels': {}, 'lines': []}
 
-        detail_rows = []
-        for qso in sorted(info['qsos'],
-                          key=lambda q: (q.get('CALL', ''),
-                                         q.get('QSO_DATE', ''),
-                                         q.get('TIME_ON', ''))):
-            call  = qso.get('CALL', '')
-            name  = qso.get('NAME', '').strip()
-            t_raw = qso.get('TIME_ON', '')
-            t_fmt = (f"{t_raw[:2]}:{t_raw[2:4]}Z"
-                     if t_raw and len(t_raw) >= 4 else '')
-            d_fmt = _fmt_date(qso.get('QSO_DATE', ''))
-            city  = (qso.get('QTH', '') or qso.get('CITY', '')).strip()
-            band  = qso.get('BAND', '').lower()
+    def _add(tr):
+        traces.append(tr)
+        return len(traces) - 1
 
-            meta = [x for x in [d_fmt, t_fmt, city, band] if x]
-            row  = f"<b style='color:#dce8f4'>{call}</b>"
-            if name:
-                row += f"&nbsp;<span style='color:#aabbd0'>{name}</span>"
-            if meta:
-                row += (f"<br>&nbsp;&nbsp;<span style='color:#607890'>"
-                        f"{' · '.join(meta)}</span>")
-            detail_rows.append(row)
+    # Fills: one choropleth per unit, z = palette index (+0.5) on a stepped scale
+    n_pal = len(REGION_PALETTE)
+    cscale = []
+    for i, c in enumerate(REGION_PALETTE):
+        cscale += [[i / n_pal, c], [(i + 1) / n_pal, c]]
+    for u in UNITS:
+        geoms = [(i, index.geom[u].get(k)) for i, k in enumerate(units[u]['keys'])
+                 if index.geom[u].get(k) is not None]
+        feats = _geojson_features(geoms, 0.02 if u in _AREA_UNITS else None)
+        payload_units[u]['shape'] = sorted(int(f['id']) for f in feats)
+        T['fill'][u] = _add(go.Choropleth(
+            geojson={'type': 'FeatureCollection', 'features': feats},
+            featureidkey='id', locations=[], z=[],
+            zmin=0, zmax=n_pal, colorscale=cscale, showscale=False,
+            marker=dict(opacity=0.45 if u not in _AREA_UNITS else 0.30,
+                        line=dict(width=0.4, color='rgba(220,230,240,0.25)')),
+            hoverinfo='skip', visible=False, name=f'fill-{u}'))
 
-        overflow = len(detail_rows) - 25
-        if overflow > 0:
-            detail_rows = detail_rows[:25]
-            detail_rows.append(
-                f"<span style='color:#8899aa'>… and {overflow} more</span>")
+    # Initial view: the page zooms, so 'auto' shows the whole world rather
+    # than cropping the globe; 'poles' still trims the polar regions.
+    lon0, lon1, lat0, lat1 = ((-180.0, 180.0, *_POLES_LAT) if args.extent == 'poles'
+                              else (-180.0, 180.0, -90.0, 90.0))
 
-        hover += '<br>'.join(detail_rows)
+    # Reference layers
 
-        by_band_dots[top_band]['lats'].append(info['dot_lat'])
-        by_band_dots[top_band]['lons'].append(info['dot_lon'])
-        by_band_dots[top_band]['hovers'].append(hover)
+    def _grid_lines(dlon, dlat):
+        lats, lons = [], []
+        x = -180.0
+        while x <= 180.0:
+            ys = [y / 1.0 for y in range(-90, 91, 5)]
+            lats += ys + [None]; lons += [x] * len(ys) + [None]
+            x += dlon
+        y = -90.0
+        while y <= 90.0:
+            xs = [float(v) for v in range(-180, 181, 2)]
+            lats += [y] * len(xs) + [None]; lons += xs + [None]
+            y += dlat
+        return lats, lons
 
-    dot_traces = []
-    for band in sorted(by_band_dots, key=_band_sort_key):
-        d     = by_band_dots[band]
-        color = BAND_COLORS.get(band, UNKNOWN_COLOR)
-        dot_traces.append(go.Scattergeo(
-            lat=d['lats'], lon=d['lons'],
-            mode='markers',
-            marker=dict(size=12, color=color, opacity=0.9,
-                        line=dict(width=0.5, color=color)),
-            customdata=d['hovers'],
-            hovertemplate='%{customdata}<extra></extra>',
-            name=band,
-            legendgroup=band,
-        ))
+    la, lo = _grid_lines(2.0, 1.0)
+    T['gsquares'] = _add(go.Scattergeo(lat=la, lon=lo, mode='lines', hoverinfo='skip',
+                                       line=dict(width=0.5, color=_GRIDLINE_CLR),
+                                       opacity=0.35, visible=False, name='squares'))
+    la, lo = _grid_lines(20.0, 10.0)
+    T['gfields'] = _add(go.Scattergeo(lat=la, lon=lo, mode='lines', hoverinfo='skip',
+                                      line=dict(width=1.2, color=_GRIDLINE_CLR),
+                                      opacity=0.7, visible=False, name='fields'))
+    flat, flon, ftxt = [], [], []
+    for fi in range(18):
+        for fj in range(18):
+            flon.append(-170.0 + fi * 20.0); flat.append(-85.0 + fj * 10.0)
+            ftxt.append(chr(65 + fi) + chr(65 + fj))
+    T['gflabels'] = _add(go.Scattergeo(lat=flat, lon=flon, text=ftxt, mode='text',
+                                       hoverinfo='skip', visible=False, name='field-labels',
+                                       textfont=dict(size=18, color=_GRIDLINE_CLR,
+                                                     family='monospace')))
 
-    # ── Home station ──────────────────────────────────────────────────────────
-    home_traces = []
+    import cartopy.io.shapereader as shpreader
+    slats, slons = [], []
+    try:
+        shp1 = shpreader.natural_earth(resolution='10m', category='cultural',
+                                       name='admin_1_states_provinces')
+        for rec in shpreader.Reader(shp1).records():
+            if rec.attributes.get('adm0_a3') not in ('USA', 'CAN'):
+                continue
+            g = rec.geometry.simplify(0.02, preserve_topology=True)
+            for poly in getattr(g, 'geoms', [g]):
+                xs, ys = poly.exterior.xy
+                slons.extend([round(v, 3) for v in xs] + [None])
+                slats.extend([round(v, 3) for v in ys] + [None])
+    except Exception as exc:
+        log.debug("State borders unavailable: %s", exc)
+    T['borders'] = _add(go.Scattergeo(lat=slats, lon=slons, mode='lines', hoverinfo='skip',
+                                      line=dict(width=0.6, color=_STATE_CLR),
+                                      visible=False, name='state-borders'))
+    T['cnames'] = _add(go.Scattergeo(
+        lat=[v[0] for v in COUNTRY_CENTROIDS.values()],
+        lon=[v[1] for v in COUNTRY_CENTROIDS.values()],
+        text=list(COUNTRY_CENTROIDS), mode='text', hoverinfo='skip', visible=False,
+        textfont=dict(size=13, color='#7a9aaa', family='monospace'), name='country-names'))
+    T['snames'] = _add(go.Scattergeo(
+        lat=[v[0] for v in STATE_CENTROIDS.values()],
+        lon=[v[1] for v in STATE_CENTROIDS.values()],
+        text=list(STATE_CENTROIDS), mode='text', hoverinfo='skip', visible=False,
+        textfont=dict(size=11, color='#8899aa', family='monospace'), name='state-names'))
+
+    # Great-circle lines: one trace per palette colour (a trace has one colour)
+    for c in REGION_PALETTE:
+        T['lines'].append(_add(go.Scattergeo(
+            lat=[], lon=[], mode='lines', hoverinfo='skip', visible=False,
+            line=dict(width=1.0, color=c), name='lines')))
+
+    # Dots and their name labels, one trace per unit
+    for u in UNITS:
+        T['dots'][u] = _add(go.Scattergeo(
+            lat=[], lon=[], mode='markers', visible=False, name=f'dots-{u}',
+            marker=dict(size=10, color=[], opacity=0.95,
+                        line=dict(width=1, color=_MAP_BG)),
+            hovertext=[], hoverinfo='text'))
+        T['labels'][u] = _add(go.Scattergeo(
+            lat=[], lon=[], text=[], mode='text', textposition='top center',
+            hoverinfo='skip', visible=False, name=f'labels-{u}',
+            textfont=dict(size=12, color=[], family='monospace')))
+
     if home_pos:
-        home_lat, home_lon = home_pos
-        home_traces = [go.Scattergeo(
-            lat=[home_lat], lon=[home_lon],
-            mode='markers',
-            marker=dict(size=14, symbol='star', color='#FFFF00',
+        T['home'] = _add(go.Scattergeo(
+            lat=[home_pos[0]], lon=[home_pos[1]], mode='markers', name='home',
+            marker=dict(size=16, symbol='star', color='#FFFF00',
                         line=dict(color='#FF8800', width=1)),
-            name='Home',
-            hovertemplate='Home station<extra></extra>',
-        )]
+            hovertemplate='Home station<extra></extra>'))
 
-    # ── Optional text label traces ────────────────────────────────────────────
-    label_traces = []
-    if args.label_countries:
-        label_traces.append(go.Scattergeo(
-            lat=[v[0] for v in COUNTRY_CENTROIDS.values()],
-            lon=[v[1] for v in COUNTRY_CENTROIDS.values()],
-            text=list(COUNTRY_CENTROIDS.keys()),
-            mode='text',
-            textfont=dict(size=16, color='#7a9aaa', family='monospace'),
-            hoverinfo='skip', showlegend=False,
-        ))
-    if args.label_states:
-        label_traces.append(go.Scattergeo(
-            lat=[v[0] for v in STATE_CENTROIDS.values()],
-            lon=[v[1] for v in STATE_CENTROIDS.values()],
-            text=list(STATE_CENTROIDS.keys()),
-            mode='text',
-            textfont=dict(size=14, color='#8899aa', family='monospace'),
-            hoverinfo='skip', showlegend=False,
-        ))
-        # Draw state/province borders from the cached Natural Earth shapefile
-        import cartopy.io.shapereader as shpreader
-        try:
-            shpfile = shpreader.natural_earth(
-                resolution='10m', category='cultural',
-                name='admin_1_states_provinces')
-            slats, slons = [], []
-            for record in shpreader.Reader(shpfile).records():
-                if record.attributes.get('admin') not in (
-                        'United States of America', 'Canada'):
-                    continue
-                geom = record.geometry
-                polys = (list(geom.geoms)
-                         if geom.geom_type == 'MultiPolygon' else [geom])
-                for poly in polys:
-                    xs, ys = poly.exterior.xy
-                    slons.extend(list(xs) + [None])
-                    slats.extend(list(ys) + [None])
-            if slats:
-                label_traces.append(go.Scattergeo(
-                    lat=slats, lon=slons, mode='lines',
-                    line=dict(width=0.6, color='#5aaa5a'),
-                    hoverinfo='skip', showlegend=False,
-                ))
-        except Exception as exc:
-            log.debug('State border shapefile unavailable: %s', exc)
-
-    # ── Assemble figure ───────────────────────────────────────────────────────
-    fig = go.Figure(data=line_traces + dot_traces + home_traces + label_traces)
-
+    fig = go.Figure(data=traces)
     fig.update_geos(
         projection_type='natural earth',
-        showland=True,        landcolor='#1e3a1e',
-        showocean=True,       oceancolor='#0d1b2a',
-        showlakes=True,       lakecolor='#0d1b2a',
+        showland=True,        landcolor=_LAND_COLOR,
+        showocean=True,       oceancolor=_MAP_BG,
+        showlakes=True,       lakecolor=_MAP_BG,
         showrivers=False,
-        showcoastlines=True,  coastlinecolor='#3a7a3a', coastlinewidth=0.5,
-        showcountries=True,   countrycolor='#4a9a4a',   countrywidth=0.7,
+        showcoastlines=True,  coastlinecolor=_COAST_CLR, coastlinewidth=0.6,
+        showcountries=True,   countrycolor='#6a6050',   countrywidth=0.6,
         showsubunits=False,
-        bgcolor='#0d1b2a',
-        lataxis=dict(showgrid=True, gridcolor='#1e3050', dtick=30),
-        lonaxis=dict(showgrid=True, gridcolor='#1e3050', dtick=30),
+        bgcolor=_MAP_BG,
+        lataxis=dict(showgrid=True, gridcolor=_GRID_CLR, dtick=30, range=[lat0, lat1]),
+        lonaxis=dict(showgrid=True, gridcolor=_GRID_CLR, dtick=30, range=[lon0, lon1]),
     )
-
-    total     = sum(len(info['qsos']) for info in groups.values())
-    unique_cs = len({qso.get('CALL', '')
-                     for info in groups.values() for qso in info['qsos']})
-
     fig.update_layout(
-        paper_bgcolor='#0d1b2a',
-        margin=dict(l=0, r=0, t=0, b=0),
-        legend=dict(
-            x=1, y=0, xanchor='right', yanchor='bottom',
-            bgcolor='rgba(13,27,42,0.85)',
-            bordercolor='#334455', borderwidth=1,
-            font=dict(color='white', size=20, family='monospace'),
-            title=dict(text='Band', font=dict(color='#8899aa', size=20)),
-        ),
-        hoverlabel=dict(
-            bgcolor='#0d1b2a', bordercolor='#3a5a7a', align='left',
-            font=dict(family='monospace', size=12, color='#c8d8e8'),
-        ),
-        annotations=[dict(
-            text=(f"Contacts: {total:,}  |  Grids: {len(groups):,}"
-                  f"  |  Callsigns: {unique_cs:,}"),
-            xref='paper', yref='paper',
-            x=0.01, y=0.02, xanchor='left', yanchor='bottom',
-            showarrow=False,
-            font=dict(family='monospace', size=20, color='#c8d8e8'),
-            bgcolor='rgba(13,27,42,0.85)',
-            bordercolor='#3a5a7a', borderwidth=1, borderpad=6,
-        )],
+        paper_bgcolor=_MAP_BG, margin=dict(l=0, r=0, t=0, b=0), showlegend=False,
+        hoverlabel=dict(bgcolor=_MAP_BG, bordercolor='#3a5a7a', align='left',
+                        font=dict(family='monospace', size=13, color='#c8d8e8')),
     )
 
-    _click_js = """\
-(function () {
-    function attachClickHandler() {
-        var gd = document.querySelector('.js-plotly-plot');
-        if (!gd) { setTimeout(attachClickHandler, 100); return; }
-        var pinned = {};
-        var zTop = 9999;
-        gd.style.position = 'relative';
-        gd.on('plotly_click', function (data) {
-            if (!data || !data.points || !data.points.length) return;
-            var pt = data.points[0];
-            if (!pt.customdata) return;
-            var key = pt.curveNumber + '_' + pt.pointNumber;
-            if (pinned[key]) { pinned[key].remove(); delete pinned[key]; return; }
-            var evt = data.event;
-            var rect = gd.getBoundingClientRect();
-            var x = evt.clientX - rect.left;
-            var y = evt.clientY - rect.top;
-
-            var popup = document.createElement('div');
-            popup.style.cssText = 'position:absolute;left:' + (x + 14) + 'px;top:' + (y - 14) + 'px;'
-                + 'background:#0d1b2a;border:1px solid #3a5a7a;border-radius:5px;'
-                + 'font-family:monospace;font-size:14px;color:#c8d8e8;max-width:380px;'
-                + 'box-shadow:0 3px 12px rgba(0,0,0,0.7);line-height:1.5;'
-                + 'pointer-events:auto;overflow:hidden;z-index:' + (++zTop) + ';';
-            popup.onclick = function (e) { e.stopPropagation(); };
-
-            // Title bar: drag grip (left) + dismiss button (right)
-            var bar = document.createElement('div');
-            bar.style.cssText = 'display:flex;align-items:center;justify-content:space-between;'
-                + 'background:#1a3a5a;border-bottom:1px solid #2a5070;'
-                + 'border-radius:4px 4px 0 0;padding:3px 6px;cursor:move;';
-
-            var grip = document.createElement('span');
-            grip.style.cssText = 'color:#4a7a9a;font-size:11px;letter-spacing:3px;'
-                + 'user-select:none;pointer-events:none;';
-            grip.innerHTML = '&#8942;&#8942;&#8942;';
-
-            var btn = document.createElement('button');
-            btn.innerHTML = '&times;';
-            btn.title = 'Dismiss';
-            btn.style.cssText = 'background:none;border:none;color:#8899aa;cursor:pointer;'
-                + 'font-size:16px;padding:0 2px;line-height:1;';
-            btn.onclick = (function (k, p) {
-                return function (e) { e.stopPropagation(); p.remove(); delete pinned[k]; };
-            }(key, popup));
-
-            bar.appendChild(grip);
-            bar.appendChild(btn);
-
-            var body = document.createElement('div');
-            body.style.cssText = 'padding:8px 12px 10px 12px;';
-            body.innerHTML = pt.customdata;
-
-            popup.appendChild(bar);
-            popup.appendChild(body);
-            gd.appendChild(popup);
-            pinned[key] = popup;
-
-            // Drag: mousedown on bar (not on the close button) starts a drag
-            bar.addEventListener('mousedown', function (e) {
-                if (e.target === btn) return;
-                e.preventDefault();
-                e.stopPropagation();
-                popup.style.zIndex = ++zTop;
-                var sx = e.clientX, sy = e.clientY;
-                var sl = parseInt(popup.style.left) || 0;
-                var st = parseInt(popup.style.top)  || 0;
-                function onMove(e) {
-                    popup.style.left = (sl + e.clientX - sx) + 'px';
-                    popup.style.top  = (st + e.clientY - sy) + 'px';
-                }
-                function onUp() {
-                    document.removeEventListener('mousemove', onMove);
-                    document.removeEventListener('mouseup',   onUp);
-                }
-                document.addEventListener('mousemove', onMove);
-                document.addEventListener('mouseup',   onUp);
-            });
-        });
+    # ── Payload + starting state for the page script ─────────────────────────
+    names = args.names
+    start = {
+        'fill':     args.fill,
+        'dots':     args.boxes if args.boxes != 'none' else 'grid',
+        'lines':    bool(home_pos) and not args.no_lines,
+        'labels':   True,
+        'cnames':   names in ('countries', 'all'),
+        'snames':   names in ('states', 'all'),
+        'borders':  args.borders == 'states',
+        'gfields':  args.grid_lines in ('fields', 'squares'),
+        'gsquares': args.grid_lines == 'squares',
     }
-    attachClickHandler();
-}());
-"""
+    payload = {
+        'T': T, 'units': payload_units, 'order': list(UNITS), 'qsos': qrows,
+        'palette': REGION_PALETTE, 'bands': bands, 'bg': _MAP_BG,
+        'bandCount': {b: band_qsos[b] for b in bands}, 'bandColor': band_clr,
+        'home': list(home_pos) if home_pos else None,
+        'lineAlpha': args.line_alpha, 'start': start,
+        'stats': _summary_text(qsos_with_pos, args, index),
+    }
+    script = ('var HAMAP = ' + json.dumps(payload, separators=(',', ':')) + ';\n'
+              + _HTML_APP_JS)
 
     fig.write_html(
-        out_path,
-        include_plotlyjs=True,
-        config=dict(scrollZoom=True,
+        out_path, include_plotlyjs=True, full_html=True,
+        config=dict(scrollZoom=True, displaylogo=False,
                     modeBarButtonsToRemove=['select2d', 'lasso2d']),
-        post_script=_click_js,
+        post_script=script,
+        default_width='100%', default_height='100vh',
     )
-    log.info("HTML saved: %s", out_path)
+    size_mb = os.path.getsize(out_path) / 1e6
+    log.info("HTML saved: %s (%.1f MB)", out_path, size_mb)
+
+
+# Page script for --html: control panel, live re-colouring / filtering,
+# pinned draggable popups.  Reads the HAMAP payload defined just before it.
+_HTML_APP_JS = r"""
+(function () {
+  var H = HAMAP, T = H.T, RANK = {grid: 0, grid4: 1, region: 2, country: 3};
+  var AREA = {region: 1, country: 1};
+  var S = JSON.parse(JSON.stringify(H.start));
+  S.bands = {}; H.bands.forEach(function (b) { S.bands[b] = true; });
+  var pinned = {}, zTop = 10000, gd, panelOpen = true;
+  try { if (localStorage.getItem('hamap.panel') === '0') panelOpen = false; } catch (e) {}
+
+  // ---- URL hash: #fill=..&dots=..&bands=20m,40m&lines=0&pin=Ohio ----------
+  var pinReq = [];
+  (location.hash || '').replace(/^#/, '').split('&').forEach(function (kv) {
+    if (!kv) return;
+    var p = kv.split('='), k = decodeURIComponent(p[0]), v = decodeURIComponent(p[1] || '');
+    if (k === 'fill' || k === 'dots') S[k] = v;
+    else if (k === 'bands') { H.bands.forEach(function (b) { S.bands[b] = v.split(',').indexOf(b) >= 0; }); }
+    else if (k === 'pin') pinReq = v.split(',');
+    else if (k === 'panel') panelOpen = v !== '0';
+    else if (k === 'view') S.view = v.split(',').map(Number);   // lat,lon,zoom
+    else if (k in S) S[k] = (v === '1' || v === 'true' || v === 'on');
+  });
+
+  function esc(s) { return String(s).replace(/[&<>"]/g, function (c) {
+    return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c]; }); }
+  function active(qi) { return S.bands[H.qsos[qi][1]]; }
+  function groupActive(u, gi) { return H.units[u].q[gi].some(active); }
+  function colorUnit() {
+    var us = [S.dots, S.fill].filter(function (u) { return u && u !== 'none'; });
+    if (!us.length) return 'grid';
+    return us.reduce(function (a, b) { return RANK[a] >= RANK[b] ? a : b; });
+  }
+  function palIdx(u, gi) {
+    var cu = colorUnit(), U = H.units[u];
+    if (RANK[cu] <= RANK[u]) return U.color[gi];
+    return H.units[cu].color[U.maj[cu][gi]];
+  }
+
+  // ---- great circle -------------------------------------------------------
+  function gc(la1, lo1, la2, lo2) {
+    var r = Math.PI / 180, p1 = la1 * r, l1 = lo1 * r, p2 = la2 * r, l2 = lo2 * r;
+    var d = 2 * Math.asin(Math.sqrt(Math.pow(Math.sin((p2 - p1) / 2), 2) +
+            Math.cos(p1) * Math.cos(p2) * Math.pow(Math.sin((l2 - l1) / 2), 2)));
+    var lats = [], lons = [];
+    if (d < 1e-8) return [[la1, la2], [lo1, lo2]];
+    var n = Math.max(8, Math.round(d / r * 2));
+    for (var i = 0; i <= n; i++) {
+      var f = i / n, A = Math.sin((1 - f) * d) / Math.sin(d), B = Math.sin(f * d) / Math.sin(d);
+      var x = A * Math.cos(p1) * Math.cos(l1) + B * Math.cos(p2) * Math.cos(l2);
+      var y = A * Math.cos(p1) * Math.sin(l1) + B * Math.cos(p2) * Math.sin(l2);
+      var z = A * Math.sin(p1) + B * Math.sin(p2);
+      lats.push(Math.atan2(z, Math.sqrt(x * x + y * y)) / r); lons.push(Math.atan2(y, x) / r);
+    }
+    return [lats, lons];
+  }
+
+  // ---- render: rebuild every dynamic trace from the state -----------------
+  function render() {
+    var D = gd.data;
+    H.order.forEach(function (u) {
+      var U = H.units[u], n = U.label.length;
+      // fill
+      var ft = D[T.fill[u]], locs = [], zs = [];
+      if (S.fill === u) U.shape.forEach(function (gi) {
+        if (groupActive(u, gi)) { locs.push(String(gi)); zs.push(palIdx(u, gi) + 0.5); }
+      });
+      ft.locations = locs; ft.z = zs; ft.visible = S.fill === u;
+      // dots + labels
+      var dt = D[T.dots[u]], lt = D[T.labels[u]], on = S.dots === u;
+      var la = [], lo = [], col = [], hov = [], txt = [], tcol = [];
+      for (var gi = 0; gi < n; gi++) {
+        var qs = U.q[gi].filter(active), c = H.palette[palIdx(u, gi)];
+        var ok = on && qs.length > 0;
+        la.push(ok ? U.lat[gi] : null); lo.push(ok ? U.lon[gi] : null); col.push(c);
+        var calls = {}; qs.forEach(function (qi) { calls[H.qsos[qi][0]] = 1; });
+        hov.push(esc(U.label[gi]) + ' — ' + qs.length + ' QSO' + (qs.length === 1 ? '' : 's')
+                 + ', ' + Object.keys(calls).length + ' call' + (Object.keys(calls).length === 1 ? '' : 's')
+                 + '<br><i>click for details</i>');
+        txt.push(ok ? U.label[gi] : ''); tcol.push(c);
+      }
+      dt.lat = la; dt.lon = lo; dt.marker.color = col; dt.hovertext = hov; dt.visible = on;
+      lt.lat = la; lt.lon = lo; lt.text = txt; lt.textfont.color = tcol;
+      lt.visible = on && S.labels && !!AREA[u];
+    });
+    // great-circle lines, bucketed by colour
+    var buckets = H.palette.map(function () { return [[], []]; }), nl = 0;
+    if (S.lines && H.home && S.dots !== 'none') {
+      var U = H.units[S.dots];
+      for (var gi = 0; gi < U.label.length; gi++) {
+        if (!groupActive(S.dots, gi)) continue;
+        var p = gc(H.home[0], H.home[1], U.lat[gi], U.lon[gi]), b = buckets[palIdx(S.dots, gi)];
+        b[0].push.apply(b[0], p[0]); b[0].push(null); b[1].push.apply(b[1], p[1]); b[1].push(null);
+        nl++;
+      }
+    }
+    var alpha = H.lineAlpha !== null ? H.lineAlpha
+              : Math.max(0.15, 0.5 * Math.min(1, Math.sqrt(40 / Math.max(nl, 1))));
+    T.lines.forEach(function (ti, i) {
+      D[ti].lat = buckets[i][0]; D[ti].lon = buckets[i][1];
+      D[ti].opacity = alpha; D[ti].visible = S.lines && nl > 0;
+    });
+    // Dot names already name each worked state/country: map names would repeat them
+    var dotNames = S.labels && !!AREA[S.dots];
+    D[T.cnames].visible = S.cnames && !dotNames; D[T.snames].visible = S.snames && !dotNames;
+    D[T.borders].visible = S.borders;
+    D[T.gfields].visible = S.gfields || S.gsquares; D[T.gflabels].visible = S.gfields || S.gsquares;
+    D[T.gsquares].visible = S.gsquares;
+    gd.layout.datarevision = (gd.layout.datarevision || 0) + 1;
+    Plotly.react(gd, D, gd.layout);
+    Object.keys(pinned).forEach(function (k) { pinned[k].refresh(); });
+    writeHash();
+  }
+
+  function writeHash() {
+    var off = H.bands.filter(function (b) { return !S.bands[b]; });
+    var h = 'fill=' + S.fill + '&dots=' + S.dots;
+    if (off.length) h += '&bands=' + H.bands.filter(function (b) { return S.bands[b]; }).join(',');
+    ['lines', 'labels', 'cnames', 'snames', 'borders', 'gfields', 'gsquares'].forEach(function (k) {
+      if (S[k] !== H.start[k]) h += '&' + k + '=' + (S[k] ? 1 : 0);
+    });
+    if (S.view) h += '&view=' + S.view.map(function (x) { return +x.toFixed(2); }).join(',');
+    history.replaceState(null, '', '#' + h);
+  }
+
+  // ---- popups ----------------------------------------------------------------
+  function popupHTML(u, gi) {
+    var U = H.units[u], c = H.palette[palIdx(u, gi)];
+    var qs = U.q[gi].filter(active), byBand = {};
+    qs.forEach(function (qi) { var q = H.qsos[qi]; (byBand[q[1]] = byBand[q[1]] || []).push(q); });
+    var calls = {}; qs.forEach(function (qi) { calls[H.qsos[qi][0]] = 1; });
+    var h = '<div style="font-weight:bold;color:' + c + ';font-size:15px">' + esc(U.label[gi]) + '</div>'
+          + '<div style="color:#8899aa;margin-bottom:6px">' + qs.length + ' QSO' + (qs.length === 1 ? '' : 's')
+          + ' · ' + Object.keys(calls).length + ' call' + (Object.keys(calls).length === 1 ? '' : 's') + '</div>';
+    if (!qs.length) return h + '<div style="color:#8899aa">No QSOs on the selected bands</div>';
+    H.bands.forEach(function (b) {
+      var rows = byBand[b]; if (!rows) return;
+      rows.sort(function (x, y) { return (x[0] + x[3] + x[4]).localeCompare(y[0] + y[3] + y[4]); });
+      h += '<div style="margin-top:4px;border-top:1px solid #1e3050;padding-top:3px">'
+         + '<span style="color:' + H.bandColor[b] + ';font-weight:bold">' + esc(b) + '</span></div>';
+      rows.forEach(function (q) {
+        var meta = [q[3], q[4], q[5]].filter(Boolean).map(esc).join(' · ');
+        h += '<div style="padding-left:8px"><b style="color:' + H.bandColor[b] + '">' + esc(q[0]) + '</b>'
+           + (q[2] ? '&nbsp;<span style="color:#aabbd0">' + esc(q[2]) + '</span>' : '')
+           + (meta ? '<br><span style="color:#607890;padding-left:10px">' + meta + '</span>' : '') + '</div>';
+      });
+    });
+    return h;
+  }
+
+  function pin(u, gi, x, y) {
+    var key = u + ':' + gi;
+    if (pinned[key]) { pinned[key].el.remove(); delete pinned[key]; return; }
+    var el = document.createElement('div');
+    el.style.cssText = 'position:absolute;left:' + x + 'px;top:' + y + 'px;background:' + '#0d1b2a'
+      + ';border:1px solid #3a5a7a;border-radius:5px;font:13px/1.45 monospace;color:#c8d8e8;'
+      + 'min-width:220px;max-width:380px;box-shadow:0 3px 12px rgba(0,0,0,.7);z-index:' + (++zTop);
+    var bar = document.createElement('div');
+    bar.style.cssText = 'display:flex;justify-content:space-between;align-items:center;'
+      + 'background:#1a3a5a;border-bottom:1px solid #2a5070;border-radius:4px 4px 0 0;padding:2px 6px;cursor:move';
+    bar.innerHTML = '<span style="color:#4a7a9a;letter-spacing:3px;user-select:none">&#8942;&#8942;&#8942;</span>';
+    var x_ = document.createElement('button');
+    x_.innerHTML = '&times;'; x_.title = 'Dismiss';
+    x_.style.cssText = 'background:none;border:none;color:#8899aa;cursor:pointer;font-size:16px;line-height:1';
+    x_.onclick = function (e) { e.stopPropagation(); el.remove(); delete pinned[key]; };
+    bar.appendChild(x_);
+    var body = document.createElement('div');
+    body.style.cssText = 'padding:6px 10px 8px;max-height:60vh;overflow-y:auto';
+    el.appendChild(bar); el.appendChild(body);
+    el.onclick = function (e) { e.stopPropagation(); };
+    bar.addEventListener('mousedown', function (e) {
+      if (e.target === x_) return;
+      e.preventDefault(); el.style.zIndex = ++zTop;
+      var sx = e.clientX, sy = e.clientY, sl = el.offsetLeft, st = el.offsetTop;
+      function mv(e) { el.style.left = (sl + e.clientX - sx) + 'px'; el.style.top = (st + e.clientY - sy) + 'px'; }
+      function up() { document.removeEventListener('mousemove', mv); document.removeEventListener('mouseup', up); }
+      document.addEventListener('mousemove', mv); document.addEventListener('mouseup', up);
+    });
+    pinned[key] = {el: el, refresh: function () {
+      if (S.dots !== u) { el.remove(); delete pinned[key]; return; }
+      body.innerHTML = popupHTML(u, gi);
+    }};
+    pinned[key].refresh();
+    gd.appendChild(el);
+  }
+
+  // ---- control panel -----------------------------------------------------------
+  function panel() {
+    var p = document.createElement('div');
+    p.style.cssText = 'position:absolute;left:10px;top:10px;z-index:9000;background:rgba(13,27,42,.93);'
+      + 'border:1px solid #3a5a7a;border-radius:6px;font:13px/1.5 monospace;color:#c8d8e8;'
+      + 'box-shadow:0 3px 12px rgba(0,0,0,.6);max-height:calc(100vh - 40px);overflow-y:auto';
+    var head = document.createElement('div');
+    head.style.cssText = 'padding:5px 10px;cursor:pointer;font-weight:bold;user-select:none;color:#dce8f4';
+    var body = document.createElement('div');
+    body.style.cssText = 'padding:2px 10px 8px';
+    function setOpen(o) { panelOpen = o; body.style.display = o ? '' : 'none';
+      head.textContent = (o ? '▾' : '▸') + ' Map options';
+      try { localStorage.setItem('hamap.panel', o ? '1' : '0'); } catch (e) {} }
+    head.onclick = function () { setOpen(!panelOpen); };
+    setOpen(panelOpen);
+    var NAMES = {none: 'none', grid: 'grid', grid4: 'grid4', region: 'state/country', country: 'country'};
+    function radios(title, key) {
+      var d = document.createElement('div');
+      d.innerHTML = '<div style="color:#8899aa;margin-top:6px">' + title + '</div>';
+      ['none', 'region', 'country', 'grid4', 'grid'].forEach(function (u) {
+        var l = document.createElement('label');
+        l.style.cssText = 'display:inline-block;margin-right:8px;cursor:pointer';
+        var r = document.createElement('input'); r.type = 'radio'; r.name = key; r.checked = S[key] === u;
+        r.onchange = function () { S[key] = u; render(); };
+        l.appendChild(r); l.appendChild(document.createTextNode(' ' + NAMES[u])); d.appendChild(l);
+      });
+      return d;
+    }
+    function check(label, key, color) {
+      var l = document.createElement('label');
+      l.style.cssText = 'display:block;cursor:pointer' + (color ? ';color:' + color : '');
+      var c = document.createElement('input'); c.type = 'checkbox';
+      c.checked = key.charAt(0) === '#' ? S.bands[key.slice(1)] : S[key];
+      c.onchange = function () {
+        if (key.charAt(0) === '#') S.bands[key.slice(1)] = c.checked; else S[key] = c.checked;
+        render(); };
+      l.appendChild(c); l.appendChild(document.createTextNode(' ' + label));
+      return [l, c];
+    }
+    body.appendChild(radios('Fill', 'fill'));
+    body.appendChild(radios('Dots & popups', 'dots'));
+    var lay = document.createElement('div');
+    lay.innerHTML = '<div style="color:#8899aa;margin-top:6px">Layers</div>';
+    [['great-circle lines', 'lines'], ['dot names (state/country)', 'labels'],
+     ['country names', 'cnames'], ['state names', 'snames'], ['state borders', 'borders'],
+     ['grid fields', 'gfields'], ['grid squares', 'gsquares']].forEach(function (x) {
+      if (x[1] === 'lines' && !H.home) return;
+      lay.appendChild(check(x[0], x[1])[0]); });
+    body.appendChild(lay);
+    var bd = document.createElement('div');
+    bd.innerHTML = '<div style="color:#8899aa;margin-top:6px">QSOs by band</div>';
+    var boxes = [];
+    H.bands.forEach(function (b) {
+      var w = check((b + '        ').slice(0, 6) + String(H.bandCount[b]).padStart(6), '#' + b, H.bandColor[b]);
+      w[0].style.whiteSpace = 'pre'; boxes.push([b, w[1]]); bd.appendChild(w[0]);
+    });
+    var btns = document.createElement('div'); btns.style.marginTop = '3px';
+    [['all', true], ['none', false]].forEach(function (x) {
+      var btn = document.createElement('button'); btn.textContent = x[0];
+      btn.style.cssText = 'font:12px monospace;margin-right:6px;background:#1a3a5a;color:#c8d8e8;'
+        + 'border:1px solid #3a5a7a;border-radius:3px;cursor:pointer';
+      btn.onclick = function () { boxes.forEach(function (bx) { S.bands[bx[0]] = x[1]; bx[1].checked = x[1]; });
+        render(); };
+      btns.appendChild(btn);
+    });
+    bd.appendChild(btns); body.appendChild(bd);
+    p.appendChild(head); p.appendChild(body);
+    return p;
+  }
+
+  function stats() {
+    var s = document.createElement('pre');
+    s.textContent = H.stats;
+    s.style.cssText = 'position:absolute;left:10px;bottom:10px;z-index:8000;margin:0;padding:8px 12px;'
+      + 'background:rgba(13,27,42,.9);border:1px solid #3a5a7a;border-radius:6px;'
+      + 'font:12px/1.35 monospace;color:#c8d8e8;pointer-events:none';
+    return s;
+  }
+
+  function init() {
+    gd = document.querySelector('.js-plotly-plot');
+    if (!gd || !gd.data) { setTimeout(init, 100); return; }
+    document.body.style.margin = '0';
+    document.body.style.background = H.bg;
+    document.body.style.overflow = 'hidden';
+    gd.style.position = 'relative';
+    gd.appendChild(panel()); gd.appendChild(stats());
+    gd.on('plotly_click', function (ev) {
+      if (!ev || !ev.points || !ev.points.length) return;
+      var pt = ev.points[0], u = null;
+      Object.keys(T.dots).forEach(function (k) { if (T.dots[k] === pt.curveNumber) u = k; });
+      if (!u) return;
+      var r = gd.getBoundingClientRect();
+      pin(u, pt.pointNumber, ev.event.clientX - r.left + 14, ev.event.clientY - r.top - 14);
+    });
+    render();
+    if (S.view && S.view.length === 3) {
+      Plotly.relayout(gd, {'geo.center.lat': S.view[0], 'geo.center.lon': S.view[1],
+                           'geo.projection.scale': S.view[2]});
+    }
+    // Remember pan / zoom in the URL so the view can be bookmarked
+    gd.on('plotly_relayout', function () {
+      var g = gd._fullLayout.geo;
+      if (!g || !g.center) return;
+      S.view = [g.center.lat, g.center.lon, g.projection.scale];
+      writeHash();
+    });
+    pinReq.forEach(function (name, i) {
+      var U = H.units[S.dots], gi = U.label.indexOf(name);
+      // opposite side from the panel, cascading
+      if (gi >= 0) pin(S.dots, gi, gd.clientWidth - 420 - 40 * i, 60 + 40 * i);
+    });
+  }
+  init();
+}());
+"""
 
 
 # --------------------------------------------------------------------------- #
@@ -2573,59 +3037,71 @@ def build_parser():
                    help='Open the image in a window instead of saving (image mode only)')
     p.add_argument('--my-grid', metavar='GRID',
                    help='Home station Maidenhead grid square (e.g. EN82)')
-    p.add_argument('--no-lines', action='store_true',
-                   help='Skip great-circle lines to contacts')
-    p.add_argument('--lines', dest='no_lines', action='store_false',
-                   help='Draw great-circle lines (undoes --no-lines from a profile)')
-    p.add_argument('--line-alpha', type=_line_alpha_arg, metavar='A',
-                   help="Great-circle line opacity 0..1 or 'auto' (default: auto, "
-                        "0.45 for small logs fading to 0.12 for large ones)")
-    p.add_argument('--line-width', type=_line_width_arg, metavar='PT',
-                   help="Great-circle line width in points, or 'auto' (default: auto, "
-                        "0.8 for small logs thinning to 0.4 for large ones)")
-    p.add_argument('--no-labels', action='store_true',
-                   help='Skip callsign labels on the map')
-    p.add_argument('--labels', dest='no_labels', action='store_false',
-                   help='Draw callsign labels (undoes --no-labels from a profile)')
-    p.add_argument('--dpi', type=int, default=300,
-                   help='Output resolution in DPI (default: 300)')
-    p.add_argument('--width', type=float, default=48.0,
-                   help='Figure width in inches (default: 48)')
-    # Height now follows the map extent; accepted for backward compatibility.
-    p.add_argument('--height', type=float, help=argparse.SUPPRESS)
-    p.add_argument('--extent', choices=('auto', 'full', 'poles'), default='auto',
-                   help='Map area: auto = fit contacts + margin (default), '
-                        'full = whole world, poles = world without polar regions')
     p.add_argument('--setup', action='store_true',
                    help='Download offline map data to ~/.hamap/ and exit')
-    p.add_argument('--font-size', type=float, default=3.0, metavar='PT',
-                   help='Label font size in points (default: 3.0)')
-    p.add_argument('--group-by', choices=('grid', 'entity'), default='grid',
-                   help='One info box per grid square (default) or per entity: '
-                        'US state / Canadian province, else country')
-    p.add_argument('--box-calls', type=_box_calls_arg, metavar='N',
-                   help="Callsigns per info box: 'all' (default), N for the N busiest "
-                        'plus a "+k more" footer, 0 for a summary (counts per band)')
-    p.add_argument('--color-by', choices=('band', 'region'), default='band',
-                   help='What dot/line/box colour means: band (default; most common '
-                        'band) or region (neighbouring regions get distinct colours, '
-                        'so it is obvious which dot, line and box belong together)')
-    p.add_argument('--ocean-boxes', action=argparse.BooleanOptionalAction, default=False,
-                   help='Prefer placing info boxes over open water (within '
-                        '--ocean-reach of their dot), leaving land for inland boxes')
-    p.add_argument('--ocean-reach', type=float, default=8.0, metavar='DEG',
-                   help='How far (degrees) a box may move to reach open water '
-                        '(default: 8)')
-    p.add_argument('--truncate-grids', action=argparse.BooleanOptionalAction, default=False,
-                   help='Reduce grid squares to 4-character accuracy before grouping')
-    p.add_argument('--label-countries', action=argparse.BooleanOptionalAction, default=False,
-                   help='Draw country name labels at centroid positions')
-    p.add_argument('--label-states', action=argparse.BooleanOptionalAction, default=False,
-                   help='Draw US state / Canadian province labels at centroid positions')
-    p.add_argument('--dxcc', action='store_true',
-                   help='DXCC mode: flood-fill LoTW-confirmed entities, one box per entity')
+
+    content = p.add_argument_group(
+        'map content',
+        '  Units: grid = square as logged, grid4 = 4-char square,\n'
+        '         region = US state / Canadian province, else country,\n'
+        '         country = country.\n'
+        '  Colour links what belongs together: dots, lines, boxes and fills take\n'
+        '  the colour of the coarser of the --boxes and --fill units, and\n'
+        '  neighbours always get distinct colours.')
+    content.add_argument('--boxes', choices=('grid', 'grid4', 'region', 'country', 'none'),
+                         default='grid',
+                         help='What one info box covers (default: grid); none = dots only')
+    content.add_argument('--box-calls', type=_box_calls_arg, metavar='N',
+                         help="Callsigns per info box: 'all' (default), N for the N busiest "
+                              'plus a "+k more" footer, 0 for a summary (counts per band)')
+    content.add_argument('--band-colors', choices=('on', 'off'), default='on',
+                         help='Colour callsigns in info boxes by band (default: on); '
+                              'the band rows and band key are shown either way')
+    content.add_argument('--fill', choices=('none', 'grid', 'grid4', 'region', 'country'),
+                         default='none',
+                         help='Tint every worked unit of this kind (default: none)')
+    content.add_argument('--names', choices=('none', 'countries', 'states', 'all'),
+                         default='none',
+                         help='Geographic name labels (default: none)')
+    content.add_argument('--borders', choices=('countries', 'states'), default='countries',
+                         help='countries (default), or states to add US state / '
+                              'Canadian province borders')
+    content.add_argument('--grid-lines', choices=('none', 'fields', 'squares'),
+                         default='none',
+                         help='Maidenhead overlay: fields = 20°×10° lines + labels, '
+                              'squares = also 2°×1° lines (default: none)')
+    content.add_argument('--ocean-boxes', action=argparse.BooleanOptionalAction, default=False,
+                         help='Place crowded info boxes over open water when that is '
+                              'not a big detour, leaving land for inland boxes')
+
+    lines = p.add_argument_group('great-circle lines')
+    lines.add_argument('--no-lines', action='store_true',
+                       help='Skip great-circle lines to contacts')
+    lines.add_argument('--lines', dest='no_lines', action='store_false',
+                       help='Draw great-circle lines (undoes --no-lines from a profile)')
+    lines.add_argument('--line-alpha', type=_line_alpha_arg, metavar='A',
+                       help="Line opacity 0..1 or 'auto' (default: auto, "
+                            "0.45 for small logs fading to 0.12 for large ones)")
+    lines.add_argument('--line-width', type=_line_width_arg, metavar='PT',
+                       help="Line width in points, or 'auto' (default: auto, "
+                            "0.8 for small logs thinning to 0.4 for large ones)")
+
+    canvas = p.add_argument_group('canvas')
+    canvas.add_argument('--dpi', type=int, default=300,
+                        help='Output resolution in DPI (default: 300)')
+    canvas.add_argument('--width', type=float, default=48.0,
+                        help='Figure width in inches (default: 48)')
+    # Height now follows the map extent; accepted for backward compatibility.
+    canvas.add_argument('--height', type=float, help=argparse.SUPPRESS)
+    canvas.add_argument('--extent', choices=('auto', 'full', 'poles'), default='auto',
+                        help='Map area: auto = fit contacts + margin (default), '
+                             'full = whole world, poles = world without polar regions')
+    canvas.add_argument('--font-size', type=float, default=3.0, metavar='PT',
+                        help='Info box font size in points (default: 3.0)')
 
     filt = p.add_argument_group('filtering')
+    filt.add_argument('--confirmed', choices=('lotw',),
+                      help='Only include confirmed QSOs: lotw = LOTW_QSL_RCVD=Y')
     filt.add_argument('--start', metavar='DATE', type=_parse_date_arg,
                       help='Only include QSOs on or after DATE (YYYY-MM-DD or YYYYMMDD)')
     filt.add_argument('--end', metavar='DATE', type=_parse_date_arg,
@@ -2658,20 +3134,36 @@ def build_parser():
 # Built-in profiles, keyed by long option name (as in the config file)
 BUILTIN_PROFILES = {
     'small': {
-        'label-countries': True,
-        'label-states':    True,
+        'boxes':      'grid',
+        'fill':       'region',
+        'names':      'all',
+        'borders':    'states',
     },
     'big': {
-        'truncate-grids':  True,
-        'label-countries': True,
-        'label-states':    True,
-        'group-by':        'entity',
-        'box-calls':       12,
-        'ocean-boxes':     True,
-        'color-by':        'region',
-        'line-alpha':      0.40,
-        'line-width':      0.4,
-        'width':           64,
+        'boxes':       'region',
+        'box-calls':   12,
+        'fill':        'region',
+        'names':       'all',
+        'borders':     'states',
+        'ocean-boxes': True,
+        'line-alpha':  0.40,
+        'line-width':  0.4,
+        'width':       64,
+    },
+    'grids': {
+        'boxes':      'grid4',
+        'fill':       'grid4',
+        'grid-lines': 'squares',
+        'names':      'countries',
+    },
+    'dxcc': {
+        'confirmed':   'lotw',
+        'boxes':       'country',
+        'box-calls':   12,
+        'fill':        'country',
+        'names':       'countries',
+        'ocean-boxes': True,
+        'no-lines':    True,
     },
 }
 _AUTO_BIG_GRIDS = 300      # 'auto' picks big at or above this many 4-char grids
@@ -2887,16 +3379,15 @@ def main():
         show_config(args)
         return
 
-    # ---- DXCC mode: keep only LoTW-confirmed QSOs ------------------------
-    if args.dxcc:
+    # ---- --confirmed: keep only confirmed QSOs ---------------------------
+    if args.confirmed == 'lotw':
         before  = len(records)
         records = [r for r in records if r.get('LOTW_QSL_RCVD', '').upper() == 'Y']
-        log.info("--dxcc: %d → %d LoTW-confirmed QSOs", before, len(records))
+        log.info("--confirmed lotw: %d → %d LoTW-confirmed QSOs", before, len(records))
         if not records:
             log.error("No LoTW-confirmed QSOs found (LOTW_QSL_RCVD=Y). "
                       "Ensure your ADIF export includes LoTW confirmation fields.")
             sys.exit(1)
-        args.no_lines = True
 
     # ---- Determine home station location ----------------------------------
     home_pos = None
@@ -2949,10 +3440,7 @@ def main():
             os.path.splitext(os.path.abspath(args.adif_file))[0] + ext)
 
         log.info("Generating interactive HTML map...")
-        groups = group_by_grid(qsos_with_pos, truncate=args.truncate_grids)
-        log.verbose("  %d unique grid/location groups from %d QSOs",
-                    len(groups), len(qsos_with_pos))
-        generate_html_plotly(groups, args, home_pos, out_path, log)
+        generate_html_plotly(qsos_with_pos, args, home_pos, out_path, log)
 
     else:
         # Image mode (default, or explicit --image)
