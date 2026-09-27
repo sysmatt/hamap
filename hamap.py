@@ -2404,11 +2404,11 @@ def generate_html_plotly(qsos_with_pos, args, home_pos, out_path, log):
             'maj':   maj,
         }
 
+    # [call, band, name, date, qth].  Deliberately no QSO time: the HTML is
+    # meant to be shared, and exact contact times are too much to publish.
     def _qrow(q):
-        t = q.get('TIME_ON', '')
         return [q.get('CALL', ''), _qso_band(q), q.get('NAME', '').strip(),
                 _fmt_date(q.get('QSO_DATE', '')),
-                f"{t[:2]}:{t[2:4]}Z" if len(t) >= 4 else '',
                 (q.get('QTH', '') or q.get('CITY', '')).strip()]
     qrows = [_qrow(q) for q, _ in qsos_with_pos]
 
@@ -2701,6 +2701,7 @@ _HTML_APP_JS = r"""
     gd.layout.datarevision = (gd.layout.datarevision || 0) + 1;
     Plotly.react(gd, D, gd.layout);
     Object.keys(pinned).forEach(function (k) { pinned[k].refresh(); });
+    if (gd) reposition();
     writeHash();
   }
 
@@ -2727,11 +2728,11 @@ _HTML_APP_JS = r"""
     if (!qs.length) return h + '<div style="color:#8899aa">No QSOs on the selected bands</div>';
     H.bands.forEach(function (b) {
       var rows = byBand[b]; if (!rows) return;
-      rows.sort(function (x, y) { return (x[0] + x[3] + x[4]).localeCompare(y[0] + y[3] + y[4]); });
+      rows.sort(function (x, y) { return (x[0] + x[3]).localeCompare(y[0] + y[3]); });
       h += '<div style="margin-top:4px;border-top:1px solid #1e3050;padding-top:3px">'
          + '<span style="color:' + H.bandColor[b] + ';font-weight:bold">' + esc(b) + '</span></div>';
       rows.forEach(function (q) {
-        var meta = [q[3], q[4], q[5]].filter(Boolean).map(esc).join(' · ');
+        var meta = [q[3], q[4]].filter(Boolean).map(esc).join(' · ');
         h += '<div style="padding-left:8px"><b style="color:' + H.bandColor[b] + '">' + esc(q[0]) + '</b>'
            + (q[2] ? '&nbsp;<span style="color:#aabbd0">' + esc(q[2]) + '</span>' : '')
            + (meta ? '<br><span style="color:#607890;padding-left:10px">' + meta + '</span>' : '') + '</div>';
@@ -2740,9 +2741,50 @@ _HTML_APP_JS = r"""
     return h;
   }
 
+  // ---- popups follow the map: dot lon/lat → pixel position in gd -----------
+  function dotPx(lon, lat) {
+    var geo = gd._fullLayout.geo, sp = geo && geo._subplot;
+    if (!sp || !sp.projection) return null;
+    var p = sp.projection([lon, lat]);
+    if (!p || !isFinite(p[0]) || !isFinite(p[1])) return null;
+    // Offset of the geo layer inside gd, calibrated from a dot Plotly actually
+    // drew (d3 keeps its lon/lat on the node), so it matches pixel-for-pixel.
+    var node = gd.querySelector('.scattergeo .point');
+    var d = node && node.__data__;
+    if (!d || !d.lonlat) return null;
+    var q = sp.projection(d.lonlat), r = node.getBoundingClientRect(), g = gd.getBoundingClientRect();
+    return [p[0] + (r.left + r.width / 2 - g.left - q[0]),
+            p[1] + (r.top + r.height / 2 - g.top - q[1])];
+  }
+  var leaderSvg = null;
+  function reposition() {
+    if (!leaderSvg) {
+      leaderSvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      leaderSvg.style.cssText = 'position:absolute;left:0;top:0;width:100%;height:100%;'
+        + 'pointer-events:none;overflow:visible;z-index:9500';
+      gd.appendChild(leaderSvg);
+    }
+    var lines = '';
+    Object.keys(pinned).forEach(function (k) {
+      var P = pinned[k], d = dotPx(P.lon, P.lat);
+      if (!d) { P.el.style.display = 'none'; return; }
+      P.el.style.display = '';
+      var x = d[0] + P.off[0], y = d[1] + P.off[1];
+      P.el.style.left = x + 'px'; P.el.style.top = y + 'px';
+      // leader from the dot to the nearest point of the popup's edge
+      var w = P.el.offsetWidth, h = P.el.offsetHeight;
+      var ex = Math.max(x, Math.min(d[0], x + w)), ey = Math.max(y, Math.min(d[1], y + h));
+      lines += '<line x1="' + d[0] + '" y1="' + d[1] + '" x2="' + ex + '" y2="' + ey
+             + '" stroke="' + P.color() + '" stroke-width="1.5" stroke-opacity="0.85"/>'
+             + '<circle cx="' + d[0] + '" cy="' + d[1] + '" r="7" fill="none" stroke="'
+             + P.color() + '" stroke-width="2"/>';
+    });
+    leaderSvg.innerHTML = lines;
+  }
+
   function pin(u, gi, x, y) {
     var key = u + ':' + gi;
-    if (pinned[key]) { pinned[key].el.remove(); delete pinned[key]; return; }
+    if (pinned[key]) { pinned[key].el.remove(); delete pinned[key]; reposition(); return; }
     var el = document.createElement('div');
     el.style.cssText = 'position:absolute;left:' + x + 'px;top:' + y + 'px;background:' + '#0d1b2a'
       + ';border:1px solid #3a5a7a;border-radius:5px;font:13px/1.45 monospace;color:#c8d8e8;'
@@ -2754,7 +2796,7 @@ _HTML_APP_JS = r"""
     var x_ = document.createElement('button');
     x_.innerHTML = '&times;'; x_.title = 'Dismiss';
     x_.style.cssText = 'background:none;border:none;color:#8899aa;cursor:pointer;font-size:16px;line-height:1';
-    x_.onclick = function (e) { e.stopPropagation(); el.remove(); delete pinned[key]; };
+    x_.onclick = function (e) { e.stopPropagation(); el.remove(); delete pinned[key]; reposition(); };
     bar.appendChild(x_);
     var body = document.createElement('div');
     body.style.cssText = 'padding:6px 10px 8px;max-height:60vh;overflow-y:auto';
@@ -2764,16 +2806,27 @@ _HTML_APP_JS = r"""
       if (e.target === x_) return;
       e.preventDefault(); el.style.zIndex = ++zTop;
       var sx = e.clientX, sy = e.clientY, sl = el.offsetLeft, st = el.offsetTop;
-      function mv(e) { el.style.left = (sl + e.clientX - sx) + 'px'; el.style.top = (st + e.clientY - sy) + 'px'; }
+      function mv(e) {
+        var P = pinned[key], d = P && dotPx(P.lon, P.lat);
+        if (!d) return;
+        P.off = [sl + e.clientX - sx - d[0], st + e.clientY - sy - d[1]];
+        reposition();
+      }
       function up() { document.removeEventListener('mousemove', mv); document.removeEventListener('mouseup', up); }
       document.addEventListener('mousemove', mv); document.addEventListener('mouseup', up);
     });
-    pinned[key] = {el: el, refresh: function () {
-      if (S.dots !== u) { el.remove(); delete pinned[key]; return; }
-      body.innerHTML = popupHTML(u, gi);
-    }};
+    var U = H.units[u], d0 = null;
+    pinned[key] = {el: el, lon: U.lon[gi], lat: U.lat[gi], off: [0, 0],
+      color: function () { return H.palette[palIdx(u, gi)]; },
+      refresh: function () {
+        if (S.dots !== u) { el.remove(); delete pinned[key]; return; }
+        body.innerHTML = popupHTML(u, gi);
+      }};
     pinned[key].refresh();
     gd.appendChild(el);
+    d0 = dotPx(U.lon[gi], U.lat[gi]);
+    if (d0) pinned[key].off = [x - d0[0], y - d0[1]];   // keep the offset as the map moves
+    reposition();
   }
 
   // ---- control panel -----------------------------------------------------------
@@ -2872,22 +2925,30 @@ _HTML_APP_JS = r"""
       pin(u, pt.pointNumber, ev.event.clientX - r.left + 14, ev.event.clientY - r.top - 14);
     });
     render();
-    if (S.view && S.view.length === 3) {
-      Plotly.relayout(gd, {'geo.center.lat': S.view[0], 'geo.center.lon': S.view[1],
-                           'geo.projection.scale': S.view[2]});
-    }
+    gd.on('plotly_relayouting', reposition);
+    window.addEventListener('resize', function () { setTimeout(reposition, 50); });
     // Remember pan / zoom in the URL so the view can be bookmarked
     gd.on('plotly_relayout', function () {
+      reposition();
       var g = gd._fullLayout.geo;
       if (!g || !g.center) return;
       S.view = [g.center.lat, g.center.lon, g.projection.scale];
       writeHash();
     });
-    pinReq.forEach(function (name, i) {
-      var U = H.units[S.dots], gi = U.label.indexOf(name);
-      // opposite side from the panel, cascading
-      if (gi >= 0) pin(S.dots, gi, gd.clientWidth - 420 - 40 * i, 60 + 40 * i);
-    });
+    function pinRequested() {
+      pinReq.forEach(function (name, i) {
+        var U = H.units[S.dots], gi = U.label.indexOf(name);
+        // opposite side from the panel, cascading
+        if (gi >= 0) pin(S.dots, gi, gd.clientWidth - 420 - 40 * i, 60 + 40 * i);
+      });
+    }
+    // Popups from the URL anchor to their dots once the URL view is applied
+    if (S.view && S.view.length === 3) {
+      Plotly.relayout(gd, {'geo.center.lat': S.view[0], 'geo.center.lon': S.view[1],
+                           'geo.projection.scale': S.view[2]}).then(pinRequested);
+    } else {
+      pinRequested();
+    }
   }
   init();
 }());
