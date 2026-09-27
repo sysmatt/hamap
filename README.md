@@ -167,7 +167,7 @@ So `hamap log.adi --profile big --box-calls 20` uses everything from `big` excep
 | Profile | Settings |
 |---------|----------|
 | `auto` *(default)* | Picks `small` or `big` after reading the log: `big` at ≥ 300 distinct 4-character grids (counted after date/tail filters). |
-| `small` | The plain defaults: one box per grid, all callsigns, 48 in wide. |
+| `small` | The plain defaults (one box per grid, all callsigns, 48 in wide) plus `--label-countries --label-states`. |
 | `big` | `--truncate-grids --group-by entity --box-calls 12 --ocean-boxes --color-by region --line-alpha 0.40 --line-width 0.4 --label-countries --label-states --width 64` |
 
 Run `hamap log.adi --show-config` to see the effective settings, which profile `auto` picked, and where each value came from (`*` marks anything not at its built-in default).

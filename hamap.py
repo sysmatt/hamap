@@ -2657,7 +2657,10 @@ def build_parser():
 
 # Built-in profiles, keyed by long option name (as in the config file)
 BUILTIN_PROFILES = {
-    'small': {},
+    'small': {
+        'label-countries': True,
+        'label-states':    True,
+    },
     'big': {
         'truncate-grids':  True,
         'label-countries': True,
