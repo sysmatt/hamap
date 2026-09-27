@@ -2576,7 +2576,7 @@ def generate_html_plotly(qsos_with_pos, args, home_pos, out_path, log):
 
     # ── Payload + starting state for the page script ─────────────────────────
     names = args.names
-    # Plain --html opens on state/country fill with grid4 dots; an explicit
+    # Plain --html opens on state/country fill with grid dots; an explicit
     # --fill / --boxes, or a profile chosen by name (--profile or the config
     # file's default), sets the starting view instead.
     src_of  = getattr(args, 'profile_sources', {})
@@ -2586,7 +2586,7 @@ def generate_html_plotly(qsos_with_pos, args, home_pos, out_path, log):
             return getattr(args, opt)
         return html_default
     fill0 = _start('fill', 'region')
-    dots0 = _start('boxes', 'grid4')
+    dots0 = _start('boxes', 'grid')
     start = {
         'fill':     fill0,
         'dots':     dots0 if dots0 != 'none' else 'grid',

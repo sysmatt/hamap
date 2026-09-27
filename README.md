@@ -282,7 +282,7 @@ A panel in the top-left corner controls the map. Click **Map options** to collap
 
 The band and date filters apply to everything at once, and the **statistics** box in the bottom-left corner updates to match what is shown.
 
-Colors follow the same rule as image mode (see [Map Content](#map-content)): the larger of the dot and shading units decides, and neighbors always differ. With just `--html`, the page opens with **Fill: state/country** and **Dots: grid4**. If you choose `--fill`, `--boxes`, `--names`, `--borders`, `--grid-lines` or `--no-lines`, or name a profile with `--profile` (or in your config file), those set the starting view instead. Options that only apply to images (`--width`, `--dpi`, `--font-size`, `--ocean-boxes`, `--box-calls`) are ignored. The page opens on the whole world (or without the polar regions with `--extent poles`); zoom in from there.
+Colors follow the same rule as image mode (see [Map Content](#map-content)): the larger of the dot and shading units decides, and neighbors always differ. With just `--html`, the page opens with **Fill: state/country** and **Dots: grid**. If you choose `--fill`, `--boxes`, `--names`, `--borders`, `--grid-lines` or `--no-lines`, or name a profile with `--profile` (or in your config file), those set the starting view instead. Options that only apply to images (`--width`, `--dpi`, `--font-size`, `--ocean-boxes`, `--box-calls`) are ignored. The page opens on the whole world (or without the polar regions with `--extent poles`); zoom in from there.
 
 ### Navigation and popups
 
